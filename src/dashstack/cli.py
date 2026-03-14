@@ -65,7 +65,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--input-dir",
+        "input_dir",
+        nargs="?",
         type=Path,
         default=Path("."),
         help="Directory containing dashcam clips (default: current directory).",
