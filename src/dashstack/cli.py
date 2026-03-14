@@ -82,15 +82,16 @@ def parse_args() -> argparse.Namespace:
         "--video-codec",
         default="auto",
         help=(
-            "Video encoder (default: auto). Auto-detects fastest available encoder: "
-            "h264_videotoolbox (macOS), h264_nvenc (NVIDIA), h264_vaapi (Linux), "
-            "or libx264 software fallback. Pass an explicit name to override."
+            "Video encoder (default: auto). On multi-core systems (>=4 cores), auto "
+            "selects libx264/ultrafast with parallel segment encoding for best speed. "
+            "Otherwise detects fastest HW encoder: h264_videotoolbox (macOS), "
+            "h264_nvenc (NVIDIA), h264_vaapi (Linux). Pass an explicit name to override."
         ),
     )
     parser.add_argument(
         "--video-bitrate",
         default="16M",
-        help="Target video bitrate when --video-codec is not libx264 (default: 16M).",
+        help="Target video bitrate for HW encoders and auto-detected libx264 ABR mode (default: 16M).",
     )
     parser.add_argument(
         "--crf",
@@ -315,16 +316,21 @@ def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str]]:
 
 def build_video_encode_args(args: argparse.Namespace) -> list[str]:
     if args.video_codec == "libx264":
-        return [
+        result = [
             "-c:v",
             "libx264",
             "-preset",
             args.preset,
-            "-crf",
-            str(args.crf),
-            "-pix_fmt",
-            "yuv420p",
         ]
+        if getattr(args, "use_abr", False):
+            result.extend(["-b:v", args.video_bitrate])
+        else:
+            result.extend(["-crf", str(args.crf)])
+        result.extend(["-pix_fmt", "yuv420p"])
+        encode_threads = getattr(args, "encode_threads", 0)
+        if encode_threads:
+            result.extend(["-threads", str(encode_threads)])
+        return result
 
     codec_args = [
         "-c:v",
@@ -650,8 +656,19 @@ def _main() -> int:
         workers = max(1, min((os.cpu_count() or 4) // 2, 4))
 
     codec_auto = args.video_codec == "auto"
+    cpu_optimized = False
     if codec_auto:
-        args.video_codec = detect_video_codec(args.ffmpeg_bin)
+        cores = os.cpu_count() or 1
+        hw_codec = detect_video_codec(args.ffmpeg_bin)
+        if cores >= 4 and hw_codec != "libx264":
+            # Multi-threaded libx264 ultrafast outperforms single-threaded
+            # hardware encoders at high resolutions via parallel segment
+            # encoding.  ABR mode keeps file size comparable to HW encoders.
+            args.video_codec = "libx264"
+            args.preset = "ultrafast"
+            cpu_optimized = True
+        else:
+            args.video_codec = hw_codec
 
     hwaccel_auto = args.hwaccel == "auto"
     if hwaccel_auto:
@@ -752,6 +769,14 @@ def _main() -> int:
     selected_audio_any = any(selected_audio_presence)
     selected_audio_all = all(selected_audio_presence) if selected_audio_presence else False
 
+    # Configure ABR mode and thread allocation for CPU-optimized encoding.
+    args.use_abr = cpu_optimized
+    args.encode_threads = 0
+    if cpu_optimized:
+        effective_workers_est = min(workers, len(pairs))
+        if effective_workers_est > 1:
+            args.encode_threads = max(1, (os.cpu_count() or 4) // effective_workers_est)
+
     print(f"Input directory: {input_dir}")
     print(f"Pairs selected: {len(pairs)}")
     print(f"Target panel width: {target_width}")
@@ -759,10 +784,18 @@ def _main() -> int:
     print(f"Rear panel: {target_width}x{rear_panel_h}")
     print(f"Output FPS: {fps_expr}")
     print(f"Pipeline mode: {args.pipeline}")
-    codec_label = f"{args.video_codec} (detected)" if codec_auto else args.video_codec
+    if cpu_optimized:
+        codec_label = f"{args.video_codec}/{args.preset} ABR (cpu-optimized)"
+    elif codec_auto:
+        codec_label = f"{args.video_codec} (detected)"
+    else:
+        codec_label = args.video_codec
     print(f"Video codec: {codec_label}")
     if args.video_codec == "libx264":
-        print(f"x264 preset/crf: {args.preset}/{args.crf}")
+        if args.use_abr:
+            print(f"Video bitrate: {args.video_bitrate}")
+        else:
+            print(f"x264 preset/crf: {args.preset}/{args.crf}")
     else:
         print(f"Video bitrate: {args.video_bitrate}")
     print(f"Audio source: {args.audio_source}")
@@ -829,6 +862,20 @@ def _main() -> int:
                     "Pipeline selected: segment "
                     "(single-pass cannot preserve mixed audio presence)"
                 )
+                run_segment_pipeline(
+                    args=args,
+                    pairs=pairs,
+                    probe=probe,
+                    work_dir=work_dir,
+                    output_path=output_path,
+                    target_width=target_width,
+                    front_panel_h=front_panel_h,
+                    rear_panel_h=rear_panel_h,
+                    fps_expr=fps_expr,
+                    workers=workers,
+                )
+            elif cpu_optimized and len(pairs) > 1:
+                print("Pipeline selected: segment (parallel CPU encoding)")
                 run_segment_pipeline(
                     args=args,
                     pairs=pairs,
