@@ -692,12 +692,20 @@ def _main() -> int:
     if workers is None:
         workers = max(1, min((os.cpu_count() or 4) // 2, 4))
 
+    hwaccel_auto = args.hwaccel == "auto"
+    if hwaccel_auto:
+        args.hwaccel = detect_hwaccel(args.ffmpeg_bin)
+
     codec_auto = args.video_codec == "auto"
     cpu_optimized = False
     if codec_auto:
         cores = os.cpu_count() or 1
         hw_codec = detect_video_codec(args.ffmpeg_bin)
-        if cores >= 4 and hw_codec != "libx264":
+        if args.hwaccel == "cuda" and "nvenc" in hw_codec:
+            # Full CUDA pipeline (decode + scale + overlay + encode on GPU)
+            # outperforms multi-threaded CPU encoding.
+            args.video_codec = hw_codec
+        elif cores >= 4 and hw_codec != "libx264":
             # Multi-threaded libx264 ultrafast outperforms single-threaded
             # hardware encoders at high resolutions via parallel segment
             # encoding.  ABR mode keeps file size comparable to HW encoders.
@@ -706,10 +714,6 @@ def _main() -> int:
             cpu_optimized = True
         else:
             args.video_codec = hw_codec
-
-    hwaccel_auto = args.hwaccel == "auto"
-    if hwaccel_auto:
-        args.hwaccel = detect_hwaccel(args.ffmpeg_bin)
 
     if not input_dir.exists() or not input_dir.is_dir():
         eprint(f"Input directory does not exist or is not a directory: {input_dir}")
