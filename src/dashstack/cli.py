@@ -608,7 +608,7 @@ def _print_split_plan(
             next_start = _ts_seconds(_seg_start_ts(runs[ri + 1][0]))
             gap = next_start - last_end
             gap_str = _fmt_time(gap) if gap >= 60 else f"{gap:.0f}s"
-            print(f"                 ┄┄ {gap_str} gap ┄┄")
+            print(f"    ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ {gap_str} gap ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
 
     print()
 
