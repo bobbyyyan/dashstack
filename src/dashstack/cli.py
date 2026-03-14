@@ -647,6 +647,28 @@ def _seg_duration(seg: Segment, probe: Callable[[Path], ClipProbe]) -> float:
     return probe(seg.path if isinstance(seg, MergedClip) else seg.front).duration
 
 
+def _compute_overlaps(
+    segments: list[Segment],
+    probe: Callable[[Path], ClipProbe],
+) -> list[float | None]:
+    """Compute truncated durations for segments that overlap with the next.
+
+    Returns one entry per segment: the truncated duration if the segment
+    overlaps with the next one, or None if no truncation is needed.
+    """
+    result: list[float | None] = [None] * len(segments)
+    for i in range(len(segments) - 1):
+        curr_start = _ts_seconds(_seg_start_ts(segments[i]))
+        curr_dur = _seg_duration(segments[i], probe)
+        curr_end = curr_start + curr_dur
+
+        next_start = _ts_seconds(_seg_start_ts(segments[i + 1]))
+        overlap = curr_end - next_start
+        if overlap > 0:
+            result[i] = max(0.0, curr_dur - overlap)
+    return result
+
+
 def _print_split_plan(
     runs: list[list[Segment]],
     probe: Callable[[Path], ClipProbe],
@@ -789,10 +811,14 @@ def _hwaccel_input(args: argparse.Namespace, path: str) -> list[str]:
     return flags
 
 
-def write_concat_file(path: Path, clips: list[Path]) -> None:
+def write_concat_file(
+    path: Path, clips: list[Path], durations: list[float | None] | None = None
+) -> None:
     with path.open("w", encoding="utf-8") as handle:
-        for clip in clips:
+        for i, clip in enumerate(clips):
             handle.write(f"file '{escape_concat_path(clip)}'\n")
+            if durations and durations[i] is not None:
+                handle.write(f"duration {durations[i]:.6f}\n")
 
 
 def build_segment_command(
@@ -805,6 +831,7 @@ def build_segment_command(
     rear_panel_h: int,
     fps_expr: str,
     selected_has_audio: bool,
+    max_duration: float | None = None,
 ) -> list[str]:
     cuda_filters = _use_cuda_filters(args)
     if cuda_filters:
@@ -863,6 +890,8 @@ def build_segment_command(
             ]
         )
 
+    if max_duration is not None:
+        cmd.extend(["-t", f"{max_duration:.6f}"])
     cmd.extend(["-movflags", "+faststart", str(segment_path)])
     return cmd
 
@@ -960,6 +989,7 @@ def run_single_pass_pipeline(
     *,
     args: argparse.Namespace,
     pairs: list[ClipPair],
+    probe: Callable[[Path], ClipProbe],
     work_dir: Path,
     output_path: Path,
     target_width: int,
@@ -974,8 +1004,13 @@ def run_single_pass_pipeline(
     front_list_path = work_dir / "front_concat.txt"
     rear_list_path = work_dir / "rear_concat.txt"
 
-    write_concat_file(front_list_path, [pair.front for pair in pairs])
-    write_concat_file(rear_list_path, [pair.rear for pair in pairs])
+    overlaps = _compute_overlaps(pairs, probe)
+    overlap_count = sum(1 for d in overlaps if d is not None)
+    if overlap_count:
+        print(f"Trimming {overlap_count} overlapping clip(s) to remove duplicated portions.")
+
+    write_concat_file(front_list_path, [pair.front for pair in pairs], overlaps)
+    write_concat_file(rear_list_path, [pair.rear for pair in pairs], overlaps)
 
     cmd = build_single_pass_command(
         args=args,
@@ -1031,19 +1066,28 @@ def run_segment_pipeline(
     if concat_list_path.exists():
         concat_list_path.unlink()
 
+    # Detect overlapping segments and compute truncated durations.
+    overlaps = _compute_overlaps(segments, probe)
+    overlap_count = sum(1 for d in overlaps if d is not None)
+    if overlap_count:
+        print(f"Trimming {overlap_count} overlapping segment(s) to remove duplicated portions.")
+
     # Separate into ClipPairs that need encoding and MergedClips that pass through.
     concat_entries: list[Path] = []
+    concat_durations: list[float | None] = []
     tasks: list[tuple[int, ClipPair, list[str]]] = []
     work_segment_paths: list[Path] = []
     encode_index = 0
 
-    for seg in segments:
+    for i, seg in enumerate(segments):
         if isinstance(seg, MergedClip):
             concat_entries.append(seg.path)
+            concat_durations.append(overlaps[i])  # duration directive for concat
         else:
             encode_index += 1
             segment_path = segments_dir / f"segment_{encode_index:05d}_{seg.timestamp}.mp4"
             concat_entries.append(segment_path)
+            concat_durations.append(None)  # already truncated during encoding
             work_segment_paths.append(segment_path)
 
             selected_has_audio = False
@@ -1060,6 +1104,7 @@ def run_segment_pipeline(
                 rear_panel_h=rear_panel_h,
                 fps_expr=fps_expr,
                 selected_has_audio=selected_has_audio,
+                max_duration=overlaps[i],
             )
             tasks.append((encode_index, seg, cmd))
 
@@ -1097,7 +1142,7 @@ def run_segment_pipeline(
         return
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    write_concat_file(concat_list_path, concat_entries)
+    write_concat_file(concat_list_path, concat_entries, concat_durations)
     concat_cmd = [
         args.ffmpeg_bin,
         "-hide_banner",
@@ -1566,6 +1611,7 @@ def _main(args: argparse.Namespace) -> int:
                 run_single_pass_pipeline(
                     args=args,
                     pairs=pairs,
+                    probe=probe,
                     work_dir=work_dir,
                     output_path=output_path,
                     target_width=target_width,
@@ -1642,6 +1688,7 @@ def _main(args: argparse.Namespace) -> int:
                         run_single_pass_pipeline(
                             args=args,
                             pairs=pairs,
+                            probe=probe,
                             work_dir=work_dir,
                             output_path=output_path,
                             target_width=target_width,
