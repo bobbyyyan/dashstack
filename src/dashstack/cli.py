@@ -14,8 +14,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Union
 
 
 FILE_RE = re.compile(
@@ -33,11 +34,27 @@ class ClipProbe:
     has_audio: bool
 
 
+FR_RE = re.compile(
+    r"^(?P<prefix>.*?)(?P<start_ts>\d{8}_\d{6})(?:_(?P<end_ts>\d{8}_\d{6}))?_FR\.(?P<ext>mp4|mov|m4v)$",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class ClipPair:
     timestamp: str
     front: Path
     rear: Path
+
+
+@dataclass(frozen=True)
+class MergedClip:
+    start_ts: str
+    end_ts: str
+    path: Path
+
+
+Segment = Union[ClipPair, MergedClip]
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,8 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("dashstack.mp4"),
-        help="Path for final combined output.",
+        default=None,
+        help=(
+            "Path for single combined output file. When omitted (default), split mode "
+            "produces one _FR file per continuous run in the input directory."
+        ),
     )
     parser.add_argument(
         "--work-dir",
@@ -170,6 +190,12 @@ def parse_args() -> argparse.Namespace:
             "Pass 'none' to force software decoding."
         ),
     )
+    parser.add_argument(
+        "--gap-threshold",
+        type=float,
+        default=5.0,
+        help="Seconds of gap between clips to split into separate output files (default: 5.0).",
+    )
     return parser.parse_args()
 
 
@@ -178,10 +204,10 @@ def eprint(message: str) -> None:
 
 
 def run_command(cmd: list[str], dry_run: bool) -> None:
-    printable = shlex.join(cmd)
-    print(f"$ {printable}")
     if dry_run:
         return
+    printable = shlex.join(cmd)
+    print(f"$ {printable}")
     subprocess.run(cmd, check=True)
 
 
@@ -369,11 +395,40 @@ def escape_concat_path(path: Path) -> str:
     return str(path).replace("'", "'\\''")
 
 
-def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str], list[str]]:
+def _ts_seconds(ts: str) -> float:
+    """Convert YYYYMMDD_HHMMSS timestamp to seconds since epoch."""
+    dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+    return dt.timestamp()
+
+
+def discover_pairs(
+    input_dir: Path,
+) -> tuple[list[ClipPair], list[MergedClip], list[str], list[str]]:
     grouped: dict[str, dict[str, Path]] = {}
+    merged_clips: list[MergedClip] = []
     overwritten_notes: list[str] = []
     unmatched_notes: list[str] = []
 
+    # First pass: find existing _FR files and build suppressed timestamp ranges.
+    fr_ranges: list[tuple[str, str]] = []
+    for path in sorted(input_dir.iterdir()):
+        if not path.is_file():
+            continue
+        match = FR_RE.match(path.name)
+        if not match:
+            continue
+        start_ts = match.group("start_ts")
+        end_ts = match.group("end_ts") or start_ts
+        merged_clips.append(MergedClip(start_ts=start_ts, end_ts=end_ts, path=path))
+        fr_ranges.append((start_ts, end_ts))
+
+    def is_suppressed(ts: str) -> bool:
+        for start, end in fr_ranges:
+            if start <= ts <= end:
+                return True
+        return False
+
+    # Second pass: find _F/_R files, skipping suppressed timestamps.
     for path in sorted(input_dir.iterdir()):
         if not path.is_file():
             continue
@@ -383,6 +438,13 @@ def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str], list[str
 
         timestamp = match.group("timestamp")
         camera = match.group("camera").upper()
+
+        if is_suppressed(timestamp):
+            overwritten_notes.append(
+                f"{timestamp}_{camera}: {path.name} suppressed by existing _FR file"
+            )
+            continue
+
         existing = grouped.setdefault(timestamp, {}).get(camera)
         if existing is not None:
             overwritten_notes.append(
@@ -401,7 +463,74 @@ def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str], list[str
         missing = "F" if "F" not in bucket else "R"
         unmatched_notes.append(f"{timestamp}: present={present}, missing={missing}")
 
-    return pairs, unmatched_notes, overwritten_notes
+    merged_clips.sort(key=lambda mc: mc.start_ts)
+    return pairs, merged_clips, unmatched_notes, overwritten_notes
+
+
+def _seg_start_ts(seg: Segment) -> str:
+    """Return the start timestamp of a Segment."""
+    return seg.start_ts if isinstance(seg, MergedClip) else seg.timestamp
+
+
+def split_into_runs(
+    pairs: list[ClipPair],
+    merged: list[MergedClip],
+    probe: Callable[[Path], ClipProbe],
+    gap_threshold: float,
+) -> list[list[Segment]]:
+    """Split clips into continuous runs separated by gaps > threshold."""
+    timeline: list[Segment] = []
+    timeline.extend(pairs)
+    timeline.extend(merged)
+    timeline.sort(key=_seg_start_ts)
+
+    if not timeline:
+        return []
+
+    runs: list[list[Segment]] = [[timeline[0]]]
+    for i in range(1, len(timeline)):
+        prev = timeline[i - 1]
+        curr = timeline[i]
+
+        prev_start = _ts_seconds(_seg_start_ts(prev))
+        if isinstance(prev, MergedClip):
+            prev_dur = probe(prev.path).duration
+        else:
+            prev_dur = probe(prev.front).duration
+        prev_end = prev_start + prev_dur
+
+        curr_start = _ts_seconds(_seg_start_ts(curr))
+        gap = curr_start - prev_end
+
+        if gap > gap_threshold:
+            runs.append([curr])
+        else:
+            runs[-1].append(curr)
+
+    return runs
+
+
+def _fr_output_path(run: list[Segment], input_dir: Path) -> Path:
+    """Derive _FR output filename from a run's segments."""
+    first = run[0]
+    if isinstance(first, MergedClip):
+        match = FR_RE.match(first.path.name)
+        prefix = match.group("prefix") if match else ""
+        ext = match.group("ext") if match else "mp4"
+    else:
+        match = FILE_RE.match(first.front.name)
+        prefix = match.group("prefix") if match else ""
+        ext = match.group("ext") if match else "mp4"
+
+    start_ts = _seg_start_ts(run[0])
+    end_ts = _seg_start_ts(run[-1])
+
+    if start_ts == end_ts:
+        name = f"{prefix}{start_ts}_FR.{ext}"
+    else:
+        name = f"{prefix}{start_ts}_{end_ts}_FR.{ext}"
+
+    return input_dir / name
 
 
 def _use_cuda_filters(args: argparse.Namespace) -> bool:
@@ -678,7 +807,7 @@ def run_single_pass_pipeline(
 def run_segment_pipeline(
     *,
     args: argparse.Namespace,
-    pairs: list[ClipPair],
+    segments: list[Segment],
     probe: Callable[[Path], ClipProbe],
     work_dir: Path,
     output_path: Path,
@@ -697,58 +826,73 @@ def run_segment_pipeline(
     if concat_list_path.exists():
         concat_list_path.unlink()
 
-    # Pre-build all segment commands so we can run them in parallel.
-    segment_paths: list[Path] = []
+    # Separate into ClipPairs that need encoding and MergedClips that pass through.
+    concat_entries: list[Path] = []
     tasks: list[tuple[int, ClipPair, list[str]]] = []
-    total = len(pairs)
-    for index, pair in enumerate(pairs, start=1):
-        segment_path = segments_dir / f"segment_{index:05d}_{pair.timestamp}.mp4"
-        segment_paths.append(segment_path)
+    work_segment_paths: list[Path] = []
+    encode_index = 0
 
-        selected_has_audio = False
-        if args.audio_source != "none":
-            selected_file = pair.front if args.audio_source == "front" else pair.rear
-            selected_has_audio = probe(selected_file).has_audio
-
-        cmd = build_segment_command(
-            args=args,
-            pair=pair,
-            segment_path=segment_path,
-            target_width=target_width,
-            front_panel_h=front_panel_h,
-            rear_panel_h=rear_panel_h,
-            fps_expr=fps_expr,
-            selected_has_audio=selected_has_audio,
-        )
-        tasks.append((index, pair, cmd))
-
-    effective_workers = min(workers, total)
-    if args.dry_run:
-        for idx, pair, cmd in tasks:
-            print(f"[{idx}/{total}] Building stacked segment for {pair.timestamp}")
-            run_command(cmd, True)
-    else:
-        total_dur = sum(probe(p.front).duration for _, p, _ in tasks)
-        bar = _ProgressBar(total_dur)
-        if effective_workers > 1:
-            print(f"Encoding {total} segments with {effective_workers} parallel workers...")
+    for seg in segments:
+        if isinstance(seg, MergedClip):
+            concat_entries.append(seg.path)
         else:
-            print(f"Encoding {total} segments...")
+            encode_index += 1
+            segment_path = segments_dir / f"segment_{encode_index:05d}_{seg.timestamp}.mp4"
+            concat_entries.append(segment_path)
+            work_segment_paths.append(segment_path)
 
-        def _encode(task: tuple[int, ClipPair, list[str]]) -> None:
-            idx, pair, cmd = task
-            seg_dur = probe(pair.front).duration
-            _run_with_progress(cmd, seg_dur, bar, worker_id=idx)
+            selected_has_audio = False
+            if args.audio_source != "none":
+                selected_file = seg.front if args.audio_source == "front" else seg.rear
+                selected_has_audio = probe(selected_file).has_audio
 
-        if effective_workers > 1:
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                list(executor.map(_encode, tasks))
+            cmd = build_segment_command(
+                args=args,
+                pair=seg,
+                segment_path=segment_path,
+                target_width=target_width,
+                front_panel_h=front_panel_h,
+                rear_panel_h=rear_panel_h,
+                fps_expr=fps_expr,
+                selected_has_audio=selected_has_audio,
+            )
+            tasks.append((encode_index, seg, cmd))
+
+    num_encode = len(tasks)
+
+    if num_encode > 0:
+        effective_workers = min(workers, num_encode)
+        if args.dry_run:
+            for idx, pair, cmd in tasks:
+                print(f"[{idx}/{num_encode}] Building stacked segment for {pair.timestamp}")
+                run_command(cmd, True)
         else:
-            for task in tasks:
-                _encode(task)
-        bar.finish()
+            total_dur = sum(probe(p.front).duration for _, p, _ in tasks)
+            bar = _ProgressBar(total_dur)
+            if effective_workers > 1:
+                print(f"Encoding {num_encode} segments with {effective_workers} parallel workers...")
+            else:
+                print(f"Encoding {num_encode} segments...")
 
-    write_concat_file(concat_list_path, segment_paths)
+            def _encode(task: tuple[int, ClipPair, list[str]]) -> None:
+                idx, pair, cmd = task
+                seg_dur = probe(pair.front).duration
+                _run_with_progress(cmd, seg_dur, bar, worker_id=idx)
+
+            if effective_workers > 1:
+                with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                    list(executor.map(_encode, tasks))
+            else:
+                for task in tasks:
+                    _encode(task)
+            bar.finish()
+
+    # If only one entry and it's a MergedClip, nothing to concat.
+    if len(concat_entries) == 1 and num_encode == 0:
+        return
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    write_concat_file(concat_list_path, concat_entries)
     concat_cmd = [
         args.ffmpeg_bin,
         "-hide_banner",
@@ -771,7 +915,7 @@ def run_segment_pipeline(
     if not args.keep_temp and not args.dry_run:
         if concat_list_path.exists():
             concat_list_path.unlink()
-        for segment in segment_paths:
+        for segment in work_segment_paths:
             if segment.exists():
                 segment.unlink()
         try:
@@ -784,11 +928,55 @@ def run_segment_pipeline(
             pass
 
 
+def run_split_pipeline(
+    *,
+    args: argparse.Namespace,
+    runs: list[list[Segment]],
+    probe: Callable[[Path], ClipProbe],
+    input_dir: Path,
+    work_dir: Path,
+    target_width: int,
+    front_panel_h: int,
+    rear_panel_h: int,
+    fps_expr: str,
+    workers: int = 1,
+) -> None:
+    """Process each continuous run into a separate _FR output file."""
+    for run_index, run in enumerate(runs, start=1):
+        output_path = _fr_output_path(run, input_dir)
+
+        # Skip if run is a single MergedClip (already done).
+        if len(run) == 1 and isinstance(run[0], MergedClip):
+            print(f"Run {run_index}/{len(runs)}: {output_path.name} (already merged, skipping)")
+            continue
+
+        if output_path.exists() and not args.overwrite:
+            print(f"Run {run_index}/{len(runs)}: {output_path.name} already exists, skipping")
+            continue
+
+        print(f"Run {run_index}/{len(runs)}: building {output_path.name} ({len(run)} segments)")
+
+        run_work_dir = work_dir / f"run_{run_index}"
+        run_segment_pipeline(
+            args=args,
+            segments=run,
+            probe=probe,
+            work_dir=run_work_dir,
+            output_path=output_path,
+            target_width=target_width,
+            front_panel_h=front_panel_h,
+            rear_panel_h=rear_panel_h,
+            fps_expr=fps_expr,
+            workers=workers,
+        )
+
+
 def _main() -> int:
     args = parse_args()
 
     input_dir = args.input_dir.resolve()
-    output_path = args.output.resolve()
+    split_mode = args.output is None
+    output_path = None if split_mode else args.output.resolve()
     # Make work dir unique per invocation to avoid collisions when
     # multiple dashstack processes run concurrently.
     work_dir = args.work_dir.resolve() / f"run_{os.getpid()}_{int(time.time())}"
@@ -807,13 +995,8 @@ def _main() -> int:
         cores = os.cpu_count() or 1
         hw_codec = detect_video_codec(args.ffmpeg_bin)
         if args.hwaccel == "cuda" and "nvenc" in hw_codec:
-            # Full CUDA pipeline (decode + scale + overlay + encode on GPU)
-            # outperforms multi-threaded CPU encoding.
             args.video_codec = hw_codec
         elif cores >= 4 and hw_codec != "libx264":
-            # Multi-threaded libx264 ultrafast with CRF outperforms
-            # single-threaded HW encoders at high resolutions via parallel
-            # segment encoding.
             args.video_codec = "libx264"
             args.preset = "ultrafast"
             cpu_optimized = True
@@ -824,8 +1007,8 @@ def _main() -> int:
         eprint(f"Input directory does not exist or is not a directory: {input_dir}")
         return 1
 
-    if output_path.exists() and not args.overwrite:
-        # Find the next available filename for the rename option.
+    # Output-exists prompt only applies in single-file mode.
+    if not split_mode and output_path.exists() and not args.overwrite:
         stem = output_path.stem
         suffix = output_path.suffix
         parent = output_path.parent
@@ -845,15 +1028,15 @@ def _main() -> int:
             print()
             return 1
         if choice == "o":
-            pass  # proceed with existing output_path
+            pass
         elif choice == "r":
             output_path = candidate
         else:
             return 1
 
-    pairs, unmatched, overwritten = discover_pairs(input_dir)
+    pairs, merged_clips, unmatched, overwritten = discover_pairs(input_dir)
     if overwritten:
-        print("Warning: duplicate clips for same timestamp+camera (last wins):")
+        print("Warning: clip notes:")
         for note in overwritten:
             print(f"  - {note}")
     if unmatched:
@@ -872,9 +1055,13 @@ def _main() -> int:
             return 1
         pairs = pairs[: args.limit]
 
-    if not pairs:
-        eprint("No complete F/R clip pairs found.")
+    if not pairs and not merged_clips:
+        eprint("No clips found.")
         return 1
+
+    if not pairs:
+        print("All clips already merged into _FR files. Nothing to do.")
+        return 0
 
     probe_cache: dict[Path, ClipProbe] = {}
 
@@ -884,13 +1071,14 @@ def _main() -> int:
         return probe_cache[path]
 
     # Collect all unique files that need probing and probe them in parallel.
-    # Always probe all front clips so we can show gap analysis.
     files_to_probe: list[Path] = [pairs[0].rear]
     for pair in pairs:
         files_to_probe.append(pair.front)
     if args.audio_source == "rear":
         for pair in pairs:
             files_to_probe.append(pair.rear)
+    for mc in merged_clips:
+        files_to_probe.append(mc.path)
     unique_probe_files = list(dict.fromkeys(files_to_probe))
 
     if len(unique_probe_files) > 2 and workers > 1:
@@ -901,30 +1089,39 @@ def _main() -> int:
         for f in unique_probe_files:
             probe(f)
 
-    # Show chronological clip order with gap analysis.
-    def _ts_seconds(ts: str) -> int:
-        d, t = ts.split("_")
-        return (
-            int(d[:4]) * 31536000 + int(d[4:6]) * 2592000 + int(d[6:8]) * 86400
-            + int(t[:2]) * 3600 + int(t[2:4]) * 60 + int(t[4:6])
-        )
+    # Build unified timeline for display and gap analysis.
+    timeline: list[Segment] = []
+    timeline.extend(pairs)
+    timeline.extend(merged_clips)
+    timeline.sort(key=_seg_start_ts)
 
-    print(f"\nChronological clip order ({len(pairs)} pairs):")
+    print(f"\nChronological clip order ({len(timeline)} entries):")
     gap_count = 0
-    for i, pair in enumerate(pairs, 1):
-        dur = probe(pair.front).duration
+    for i, seg in enumerate(timeline, 1):
+        ts = _seg_start_ts(seg)
+        if isinstance(seg, MergedClip):
+            dur = probe(seg.path).duration
+            label = f"  {i:3d}. {ts} ({dur:.0f}s)  [merged] {seg.path.name}"
+        else:
+            dur = probe(seg.front).duration
+            label = f"  {i:3d}. {ts} ({dur:.0f}s)  F={seg.front.name}  R={seg.rear.name}"
         if i == 1:
             gap_label = ""
         else:
-            prev = pairs[i - 2]
-            prev_end = _ts_seconds(prev.timestamp) + probe(prev.front).duration
-            gap = _ts_seconds(pair.timestamp) - prev_end
-            if gap > 5:
+            prev_seg = timeline[i - 2]
+            prev_ts = _seg_start_ts(prev_seg)
+            if isinstance(prev_seg, MergedClip):
+                prev_dur = probe(prev_seg.path).duration
+            else:
+                prev_dur = probe(prev_seg.front).duration
+            prev_end = _ts_seconds(prev_ts) + prev_dur
+            gap = _ts_seconds(ts) - prev_end
+            if gap > args.gap_threshold:
                 gap_label = f"  *** gap {gap:.0f}s ***"
                 gap_count += 1
             else:
                 gap_label = ""
-        print(f"  {i:3d}. {pair.timestamp} ({dur:.0f}s)  F={pair.front.name}  R={pair.rear.name}{gap_label}")
+        print(f"{label}{gap_label}")
     if gap_count:
         print(f"  ({gap_count} gap{'s' if gap_count != 1 else ''} detected)")
     print()
@@ -961,7 +1158,9 @@ def _main() -> int:
     total_duration = front_probe.duration * len(pairs)
 
     print(f"Input directory: {input_dir}")
-    print(f"Pairs selected: {len(pairs)}")
+    print(f"Pairs to encode: {len(pairs)}")
+    if merged_clips:
+        print(f"Existing _FR files: {len(merged_clips)}")
     print(f"Target panel width: {target_width}")
     print(f"Front panel: {target_width}x{front_panel_h}")
     print(f"Rear panel: {target_width}x{rear_panel_h}")
@@ -993,44 +1192,52 @@ def _main() -> int:
         print("GPU filters: CUDA decode + scale_cuda + NVENC encode")
     print(f"Workers: {workers}")
     print(f"Work directory: {work_dir}")
-    print(f"Output file: {output_path}")
+    if split_mode:
+        runs = split_into_runs(pairs, merged_clips, probe, args.gap_threshold)
+        print(f"Output mode: split ({len(runs)} run{'s' if len(runs) != 1 else ''})")
+        for ri, run in enumerate(runs, 1):
+            fr_path = _fr_output_path(run, input_dir)
+            n_pairs = sum(1 for s in run if isinstance(s, ClipPair))
+            n_merged = sum(1 for s in run if isinstance(s, MergedClip))
+            parts = []
+            if n_pairs:
+                parts.append(f"{n_pairs} pair{'s' if n_pairs != 1 else ''}")
+            if n_merged:
+                parts.append(f"{n_merged} merged")
+            print(f"  Run {ri}: {fr_path.name} ({', '.join(parts)})")
+    else:
+        print(f"Output file: {output_path}")
 
     try:
-        if args.pipeline == "segment":
-            print("Pipeline selected: segment")
-            run_segment_pipeline(
+        if split_mode:
+            run_split_pipeline(
                 args=args,
-                pairs=pairs,
+                runs=runs,
                 probe=probe,
+                input_dir=input_dir,
                 work_dir=work_dir,
-                output_path=output_path,
                 target_width=target_width,
                 front_panel_h=front_panel_h,
                 rear_panel_h=rear_panel_h,
                 fps_expr=fps_expr,
                 workers=workers,
             )
-        elif args.pipeline == "single-pass":
-            print("Pipeline selected: single-pass")
-            run_single_pass_pipeline(
-                args=args,
-                pairs=pairs,
-                work_dir=work_dir,
-                output_path=output_path,
-                target_width=target_width,
-                front_panel_h=front_panel_h,
-                rear_panel_h=rear_panel_h,
-                fps_expr=fps_expr,
-                selected_audio_any=selected_audio_any,
-                selected_audio_all=selected_audio_all,
-                total_duration=total_duration,
-            )
         else:
-            if len(pairs) == 1:
-                print("Pipeline selected: segment (single clip pair)")
+            # Single-file mode: build unified segment list.
+            all_segments: list[Segment] = []
+            all_segments.extend(pairs)
+            all_segments.extend(merged_clips)
+            all_segments.sort(key=_seg_start_ts)
+            has_merged = len(merged_clips) > 0
+
+            if args.pipeline == "segment" or has_merged:
+                if has_merged:
+                    print("Pipeline selected: segment (mixed pairs + merged clips)")
+                else:
+                    print("Pipeline selected: segment")
                 run_segment_pipeline(
                     args=args,
-                    pairs=pairs,
+                    segments=all_segments,
                     probe=probe,
                     work_dir=work_dir,
                     output_path=output_path,
@@ -1040,77 +1247,27 @@ def _main() -> int:
                     fps_expr=fps_expr,
                     workers=workers,
                 )
-            elif args.audio_source != "none" and selected_audio_any and not selected_audio_all:
-                print(
-                    "Pipeline selected: segment "
-                    "(single-pass cannot preserve mixed audio presence)"
-                )
-                run_segment_pipeline(
+            elif args.pipeline == "single-pass":
+                print("Pipeline selected: single-pass")
+                run_single_pass_pipeline(
                     args=args,
                     pairs=pairs,
-                    probe=probe,
                     work_dir=work_dir,
                     output_path=output_path,
                     target_width=target_width,
                     front_panel_h=front_panel_h,
                     rear_panel_h=rear_panel_h,
                     fps_expr=fps_expr,
-                    workers=workers,
-                )
-            elif _use_cuda_filters(args) and len(pairs) > 1 and workers > 1:
-                print("Pipeline selected: segment (parallel GPU encoding)")
-                run_segment_pipeline(
-                    args=args,
-                    pairs=pairs,
-                    probe=probe,
-                    work_dir=work_dir,
-                    output_path=output_path,
-                    target_width=target_width,
-                    front_panel_h=front_panel_h,
-                    rear_panel_h=rear_panel_h,
-                    fps_expr=fps_expr,
-                    workers=workers,
-                )
-            elif cpu_optimized and len(pairs) > 1:
-                print("Pipeline selected: segment (parallel CPU encoding)")
-                run_segment_pipeline(
-                    args=args,
-                    pairs=pairs,
-                    probe=probe,
-                    work_dir=work_dir,
-                    output_path=output_path,
-                    target_width=target_width,
-                    front_panel_h=front_panel_h,
-                    rear_panel_h=rear_panel_h,
-                    fps_expr=fps_expr,
-                    workers=workers,
+                    selected_audio_any=selected_audio_any,
+                    selected_audio_all=selected_audio_all,
+                    total_duration=total_duration,
                 )
             else:
-                print("Pipeline selected: single-pass (fast default)")
-                try:
-                    run_single_pass_pipeline(
-                        args=args,
-                        pairs=pairs,
-                        work_dir=work_dir,
-                        output_path=output_path,
-                        target_width=target_width,
-                        front_panel_h=front_panel_h,
-                        rear_panel_h=rear_panel_h,
-                        fps_expr=fps_expr,
-                        selected_audio_any=selected_audio_any,
-                        selected_audio_all=selected_audio_all,
-                        total_duration=total_duration,
-                    )
-                except subprocess.CalledProcessError as exc:
-                    if args.dry_run:
-                        raise
-                    eprint(
-                        "Single-pass pipeline failed "
-                        f"(exit {exc.returncode}); falling back to segment mode."
-                    )
+                if len(pairs) == 1:
+                    print("Pipeline selected: segment (single clip pair)")
                     run_segment_pipeline(
                         args=args,
-                        pairs=pairs,
+                        segments=all_segments,
                         probe=probe,
                         work_dir=work_dir,
                         output_path=output_path,
@@ -1120,6 +1277,86 @@ def _main() -> int:
                         fps_expr=fps_expr,
                         workers=workers,
                     )
+                elif args.audio_source != "none" and selected_audio_any and not selected_audio_all:
+                    print(
+                        "Pipeline selected: segment "
+                        "(single-pass cannot preserve mixed audio presence)"
+                    )
+                    run_segment_pipeline(
+                        args=args,
+                        segments=all_segments,
+                        probe=probe,
+                        work_dir=work_dir,
+                        output_path=output_path,
+                        target_width=target_width,
+                        front_panel_h=front_panel_h,
+                        rear_panel_h=rear_panel_h,
+                        fps_expr=fps_expr,
+                        workers=workers,
+                    )
+                elif _use_cuda_filters(args) and len(pairs) > 1 and workers > 1:
+                    print("Pipeline selected: segment (parallel GPU encoding)")
+                    run_segment_pipeline(
+                        args=args,
+                        segments=all_segments,
+                        probe=probe,
+                        work_dir=work_dir,
+                        output_path=output_path,
+                        target_width=target_width,
+                        front_panel_h=front_panel_h,
+                        rear_panel_h=rear_panel_h,
+                        fps_expr=fps_expr,
+                        workers=workers,
+                    )
+                elif cpu_optimized and len(pairs) > 1:
+                    print("Pipeline selected: segment (parallel CPU encoding)")
+                    run_segment_pipeline(
+                        args=args,
+                        segments=all_segments,
+                        probe=probe,
+                        work_dir=work_dir,
+                        output_path=output_path,
+                        target_width=target_width,
+                        front_panel_h=front_panel_h,
+                        rear_panel_h=rear_panel_h,
+                        fps_expr=fps_expr,
+                        workers=workers,
+                    )
+                else:
+                    print("Pipeline selected: single-pass (fast default)")
+                    try:
+                        run_single_pass_pipeline(
+                            args=args,
+                            pairs=pairs,
+                            work_dir=work_dir,
+                            output_path=output_path,
+                            target_width=target_width,
+                            front_panel_h=front_panel_h,
+                            rear_panel_h=rear_panel_h,
+                            fps_expr=fps_expr,
+                            selected_audio_any=selected_audio_any,
+                            selected_audio_all=selected_audio_all,
+                            total_duration=total_duration,
+                        )
+                    except subprocess.CalledProcessError as exc:
+                        if args.dry_run:
+                            raise
+                        eprint(
+                            "Single-pass pipeline failed "
+                            f"(exit {exc.returncode}); falling back to segment mode."
+                        )
+                        run_segment_pipeline(
+                            args=args,
+                            segments=all_segments,
+                            probe=probe,
+                            work_dir=work_dir,
+                            output_path=output_path,
+                            target_width=target_width,
+                            front_panel_h=front_panel_h,
+                            rear_panel_h=rear_panel_h,
+                            fps_expr=fps_expr,
+                            workers=workers,
+                        )
     except subprocess.CalledProcessError as exc:
         eprint(f"Command failed with exit code {exc.returncode}")
         return exc.returncode
