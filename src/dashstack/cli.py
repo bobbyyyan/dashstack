@@ -58,7 +58,7 @@ class MergedClip:
 Segment = Union[ClipPair, MergedClip]
 
 
-_SUBCOMMANDS = {"upload"}
+_SUBCOMMANDS = {"upload", "download"}
 
 
 def _add_stack_args(parser: argparse.ArgumentParser) -> None:
@@ -222,6 +222,30 @@ def _add_upload_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_download_args(parser: argparse.ArgumentParser) -> None:
+    """Add download-related arguments to *parser*."""
+    parser.add_argument(
+        "source",
+        help="rsync source, e.g. host:/path/ or user@host:/path/*.MP4",
+    )
+    parser.add_argument(
+        "destination",
+        nargs="?",
+        default=".",
+        help="Local destination directory (default: current directory).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what rsync would do without transferring.",
+    )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete remote source files after successful download.",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     # If the first positional arg isn't a known subcommand, treat the
     # invocation as the default "stack" command so that the existing
@@ -243,6 +267,11 @@ def parse_args() -> argparse.Namespace:
             help="Upload files to a remote destination via rsync.",
         )
         _add_upload_args(upload_p)
+        download_p = sub.add_parser(
+            "download",
+            help="Download files from a remote source via rsync.",
+        )
+        _add_download_args(download_p)
         # Also register stack so --help shows it.
         stack_p = sub.add_parser(
             "stack",
@@ -1592,11 +1621,108 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f}PB"
 
 
-# Matches rsync -P completion line, e.g.:
+# Matches rsync -P file-completion line, e.g.:
 #     85983232 100%   31.19MB/s    0:00:02 (xfer#1, to-check=25/26)
 _RSYNC_XFER_RE = re.compile(
     r"^\s+(?P<bytes>\d+)\s+100%\s+.*\(xfer#(?P<n>\d+),\s*to-check=(?P<remain>\d+)/(?P<total>\d+)\)"
 )
+
+# Matches rsync -P partial-progress line, e.g.:
+#     2621440   3%   31.19MB/s    0:00:02
+_RSYNC_PARTIAL_RE = re.compile(
+    r"^\s+(?P<bytes>\d+)\s+(?P<pct>\d+)%\s+"
+)
+
+
+def _run_rsync_with_progress(cmd: list[str], total_bytes: int | None = None) -> int:
+    """Run an rsync command and display an overall progress bar.
+
+    Parses both per-file partial progress and file-completion lines
+    from rsync's ``-P`` output to keep the bar moving smoothly.
+
+    Returns the rsync exit code.
+    """
+    printable = shlex.join(cmd)
+    print(f"$ {printable}")
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+    )
+    assert proc.stdout is not None
+
+    bytes_completed = 0   # bytes from fully transferred files
+    bytes_partial = 0     # bytes from the file currently in progress
+    file_pct = 0.0        # 0-1 progress within the current file
+    total_files: int | None = None
+    files_done = 0
+    start = time.monotonic()
+
+    for line in proc.stdout:
+        m = _RSYNC_XFER_RE.match(line)
+        if m:
+            # File finished — add its size to completed, reset partial.
+            bytes_completed += int(m.group("bytes"))
+            bytes_partial = 0
+            file_pct = 0.0
+            total_files = int(m.group("total"))
+            files_done = total_files - int(m.group("remain"))
+        else:
+            mp = _RSYNC_PARTIAL_RE.match(line)
+            if mp:
+                # Mid-file progress update.
+                bytes_partial = int(mp.group("bytes"))
+                file_pct = int(mp.group("pct")) / 100.0
+            else:
+                continue
+
+        current = bytes_completed + bytes_partial
+        if total_bytes:
+            pct = min(current / total_bytes, 1.0)
+        elif total_files:
+            # Blend file count with partial progress for smoother bar.
+            pct = min((files_done + file_pct) / total_files, 1.0)
+        else:
+            pct = 0.0
+
+        elapsed = time.monotonic() - start
+        filled = int(30 * pct)
+        bar = "█" * filled + "░" * (30 - filled)
+        if pct > 0.02 and elapsed > 1:
+            eta = _fmt_time(elapsed / pct * (1 - pct))
+        else:
+            eta = "--:--"
+
+        size_info = (
+            f"{_fmt_bytes(current)}/{_fmt_bytes(total_bytes)}"
+            if total_bytes
+            else f"{_fmt_bytes(current)}  {files_done}/{total_files or '?'} files"
+        )
+        print(
+            f"\r  [{bar}] {pct:4.0%}  {size_info}"
+            f"  {_fmt_time(elapsed)} elapsed  ETA {eta}  ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    proc.wait()
+
+    if bytes_completed > 0:
+        elapsed = time.monotonic() - start
+        total_display = _fmt_bytes(total_bytes) if total_bytes else _fmt_bytes(bytes_completed)
+        print(
+            f"\r  [{'█' * 30}] 100%  {total_display}"
+            f"  {_fmt_time(elapsed)} total{' ' * 30}",
+            file=sys.stderr,
+        )
+
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.read() if proc.stderr else ""
+        eprint(f"\nrsync failed with exit code {proc.returncode}")
+        if stderr_text.strip():
+            eprint(stderr_text.strip())
+
+    return proc.returncode
 
 
 def _upload(args: argparse.Namespace) -> int:
@@ -1633,53 +1759,9 @@ def _upload(args: argparse.Namespace) -> int:
     cmd += [str(f) for f in files]
     cmd.append(destination)
 
-    printable = shlex.join(cmd)
-    print(f"$ {printable}")
-
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
-    )
-    assert proc.stdout is not None
-
-    bytes_done = 0
-    start = time.monotonic()
-
-    for line in proc.stdout:
-        m = _RSYNC_XFER_RE.match(line)
-        if m:
-            bytes_done += int(m.group("bytes"))
-            pct = min(bytes_done / total_bytes, 1.0) if total_bytes else 1.0
-            elapsed = time.monotonic() - start
-            filled = int(30 * pct)
-            bar = "█" * filled + "░" * (30 - filled)
-            if pct > 0.02 and elapsed > 1:
-                eta = _fmt_time(elapsed / pct * (1 - pct))
-            else:
-                eta = "--:--"
-            print(
-                f"\r  [{bar}] {pct:4.0%}  {_fmt_bytes(bytes_done)}/{_fmt_bytes(total_bytes)}"
-                f"  {_fmt_time(elapsed)} elapsed  ETA {eta}  ",
-                end="",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    proc.wait()
-
-    if total_bytes and not args.dry_run:
-        elapsed = time.monotonic() - start
-        print(
-            f"\r  [{'█' * 30}] 100%  {_fmt_bytes(total_bytes)}/{_fmt_bytes(total_bytes)}"
-            f"  {_fmt_time(elapsed)} total{' ' * 20}",
-            file=sys.stderr,
-        )
-
-    if proc.returncode != 0:
-        stderr_text = proc.stderr.read() if proc.stderr else ""
-        eprint(f"\nrsync failed with exit code {proc.returncode}")
-        if stderr_text.strip():
-            eprint(stderr_text.strip())
-        return proc.returncode
+    rc = _run_rsync_with_progress(cmd, total_bytes=total_bytes)
+    if rc != 0:
+        return rc
 
     if args.delete and not args.dry_run:
         print(f"\nDeleting {len(files)} source file(s)...")
@@ -1691,11 +1773,36 @@ def _upload(args: argparse.Namespace) -> int:
     return 0
 
 
+def _download(args: argparse.Namespace) -> int:
+    """Download files from a remote source via rsync over SSH."""
+    rsync = shutil.which("rsync")
+    if rsync is None:
+        eprint("rsync not found on PATH.")
+        return 1
+
+    cmd = [rsync, "-avP"]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.delete:
+        cmd.append("--remove-source-files")
+    cmd.append(args.source)
+    cmd.append(args.destination)
+
+    rc = _run_rsync_with_progress(cmd)
+    if rc != 0:
+        return rc
+
+    print("Download complete.")
+    return 0
+
+
 def main() -> int:
     """Entry point that wraps _main and translates return code to sys.exit."""
     args = parse_args()
     if args.command == "upload":
         sys.exit(_upload(args))
+    elif args.command == "download":
+        sys.exit(_download(args))
     else:
         sys.exit(_main(args))
 
