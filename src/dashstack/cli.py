@@ -497,6 +497,12 @@ def _ts_seconds(ts: str) -> float:
     return dt.timestamp()
 
 
+def _seconds_to_ts(seconds: float) -> str:
+    """Convert seconds since epoch to YYYYMMDD_HHMMSS timestamp."""
+    dt = datetime.fromtimestamp(seconds)
+    return dt.strftime("%Y%m%d_%H%M%S")
+
+
 def discover_pairs(
     input_dir: Path,
 ) -> tuple[list[ClipPair], list[MergedClip], list[str], list[str]]:
@@ -606,7 +612,9 @@ def split_into_runs(
     return runs
 
 
-def _fr_output_path(run: list[Segment], input_dir: Path) -> Path:
+def _fr_output_path(
+    run: list[Segment], input_dir: Path, probe: Callable[[Path], ClipProbe]
+) -> Path:
     """Derive _FR output filename from a run's segments."""
     first = run[0]
     if isinstance(first, MergedClip):
@@ -619,7 +627,12 @@ def _fr_output_path(run: list[Segment], input_dir: Path) -> Path:
         ext = match.group("ext") if match else "mp4"
 
     start_ts = _seg_start_ts(run[0])
-    end_ts = _seg_start_ts(run[-1])
+
+    # Compute actual end timestamp from last segment's start + duration.
+    last = run[-1]
+    last_start = _ts_seconds(_seg_start_ts(last))
+    last_dur = _seg_duration(last, probe)
+    end_ts = _seconds_to_ts(last_start + last_dur)
 
     if start_ts == end_ts:
         name = f"{prefix}{start_ts}_FR.{ext}"
@@ -663,7 +676,7 @@ def _print_split_plan(
         return [seg.front.name, seg.rear.name]
 
     for ri, run in enumerate(runs):
-        fr_path = _fr_output_path(run, input_dir)
+        fr_path = _fr_output_path(run, input_dir, probe)
         run_dur = sum(_seg_duration(s, probe) for s in run)
         n_pairs = sum(1 for s in run if isinstance(s, ClipPair))
         n_merged = sum(1 for s in run if isinstance(s, MergedClip))
@@ -1135,7 +1148,7 @@ def run_split_pipeline(
 ) -> None:
     """Process each continuous run into a separate _FR output file."""
     for run_index, run in enumerate(runs, start=1):
-        output_path = _fr_output_path(run, input_dir)
+        output_path = _fr_output_path(run, input_dir, probe)
 
         # Skip if run is a single MergedClip (already done).
         if len(run) == 1 and isinstance(run[0], MergedClip):
@@ -1163,9 +1176,51 @@ def run_split_pipeline(
         )
 
 
+def _fix_fr_names(input_dir: Path, ffprobe_bin: str) -> list[tuple[Path, Path]]:
+    """Fix end timestamps in _FR filenames based on actual video duration.
+
+    Returns list of (old_path, new_path) for files that were renamed.
+    """
+    renames: list[tuple[Path, Path]] = []
+    for path in sorted(input_dir.iterdir()):
+        if not path.is_file():
+            continue
+        match = FR_RE.match(path.name)
+        if not match:
+            continue
+
+        start_ts = match.group("start_ts")
+        prefix = match.group("prefix")
+        ext = match.group("ext")
+
+        try:
+            clip = ffprobe_clip(path, ffprobe_bin)
+        except Exception:
+            continue
+
+        correct_end_ts = _seconds_to_ts(_ts_seconds(start_ts) + clip.duration)
+
+        if start_ts == correct_end_ts:
+            correct_name = f"{prefix}{start_ts}_FR.{ext}"
+        else:
+            correct_name = f"{prefix}{start_ts}_{correct_end_ts}_FR.{ext}"
+
+        if path.name == correct_name:
+            continue
+
+        new_path = input_dir / correct_name
+        if new_path.exists():
+            continue
+
+        path.rename(new_path)
+        renames.append((path, new_path))
+
+    return renames
+
+
 def _clean_source_files(input_dir: Path, dry_run: bool) -> int:
-    """Delete _F/_R files whose timestamps are covered by _FR files."""
-    fr_ranges: list[tuple[str, str]] = []
+    """Delete _F/_R files and superseded _FR files covered by _FR files."""
+    fr_files: list[tuple[Path, str, str]] = []  # (path, start, end)
     for path in sorted(input_dir.iterdir()):
         if not path.is_file():
             continue
@@ -1173,12 +1228,14 @@ def _clean_source_files(input_dir: Path, dry_run: bool) -> int:
         if match:
             start = match.group("start_ts")
             end = match.group("end_ts") or start
-            fr_ranges.append((start, end))
+            fr_files.append((path, start, end))
 
-    if not fr_ranges:
+    if not fr_files:
         return 0
 
     to_delete: list[Path] = []
+
+    # Find _F/_R source files covered by any _FR range.
     for path in sorted(input_dir.iterdir()):
         if not path.is_file():
             continue
@@ -1186,15 +1243,25 @@ def _clean_source_files(input_dir: Path, dry_run: bool) -> int:
         if not match:
             continue
         ts = match.group("timestamp")
-        for start, end in fr_ranges:
+        for _, start, end in fr_files:
             if start <= ts <= end:
                 to_delete.append(path)
+                break
+
+    # Find _FR files fully subsumed by a strictly larger _FR file.
+    for fr_path, fr_start, fr_end in fr_files:
+        for other_path, other_start, other_end in fr_files:
+            if other_path == fr_path:
+                continue
+            if (other_start <= fr_start and fr_end <= other_end
+                    and (other_start, other_end) != (fr_start, fr_end)):
+                to_delete.append(fr_path)
                 break
 
     if not to_delete:
         return 0
 
-    print(f"\n{len(to_delete)} source files covered by _FR output:")
+    print(f"\n{len(to_delete)} file(s) covered by _FR output:")
     for p in to_delete:
         print(f"  {p.name}")
 
@@ -1276,6 +1343,12 @@ def _main(args: argparse.Namespace) -> int:
             output_path = candidate
         else:
             return 1
+
+    renames = _fix_fr_names(input_dir, args.ffprobe_bin)
+    if renames:
+        print(f"Fixed {len(renames)} _FR filename(s):")
+        for old, new in renames:
+            print(f"  {old.name} → {new.name}")
 
     pairs, merged_clips, unmatched, overwritten = discover_pairs(input_dir)
     if overwritten:
