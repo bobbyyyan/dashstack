@@ -196,6 +196,11 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Seconds of gap between clips to split into separate output files (default: 5.0).",
     )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Delete source _F/_R files that are covered by _FR output files.",
+    )
     return parser.parse_args()
 
 
@@ -1051,6 +1056,48 @@ def run_split_pipeline(
         )
 
 
+def _clean_source_files(input_dir: Path, dry_run: bool) -> int:
+    """Delete _F/_R files whose timestamps are covered by _FR files."""
+    fr_ranges: list[tuple[str, str]] = []
+    for path in sorted(input_dir.iterdir()):
+        if not path.is_file():
+            continue
+        match = FR_RE.match(path.name)
+        if match:
+            start = match.group("start_ts")
+            end = match.group("end_ts") or start
+            fr_ranges.append((start, end))
+
+    if not fr_ranges:
+        return 0
+
+    to_delete: list[Path] = []
+    for path in sorted(input_dir.iterdir()):
+        if not path.is_file():
+            continue
+        match = FILE_RE.match(path.name)
+        if not match:
+            continue
+        ts = match.group("timestamp")
+        for start, end in fr_ranges:
+            if start <= ts <= end:
+                to_delete.append(path)
+                break
+
+    if not to_delete:
+        return 0
+
+    if dry_run:
+        print(f"\nWould delete {len(to_delete)} source files:")
+        for p in to_delete:
+            print(f"  {p.name}")
+    else:
+        for p in to_delete:
+            p.unlink()
+        print(f"Cleaned {len(to_delete)} source files.")
+    return len(to_delete)
+
+
 def _main() -> int:
     args = parse_args()
 
@@ -1140,6 +1187,10 @@ def _main() -> int:
         return 1
 
     if not pairs:
+        if args.clean:
+            print("All clips already merged into _FR files.")
+            _clean_source_files(input_dir, args.dry_run)
+            return 0
         print("All clips already merged into _FR files. Nothing to do.")
         return 0
 
@@ -1437,6 +1488,9 @@ def _main() -> int:
     except RuntimeError as exc:
         eprint(str(exc))
         return 1
+
+    if args.clean and split_mode:
+        _clean_source_files(input_dir, args.dry_run)
 
     print("Done.")
     return 0
