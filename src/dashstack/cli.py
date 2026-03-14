@@ -10,6 +10,8 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -181,6 +183,88 @@ def run_command(cmd: list[str], dry_run: bool) -> None:
     if dry_run:
         return
     subprocess.run(cmd, check=True)
+
+
+def _fmt_time(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+class _ProgressBar:
+    """Thread-safe progress bar with ETA for ffmpeg encoding."""
+
+    def __init__(self, total_seconds: float) -> None:
+        self._total = max(total_seconds, 0.001)
+        self._completed = 0.0
+        self._active: dict[int, float] = {}
+        self._lock = threading.Lock()
+        self._start = time.monotonic()
+
+    def update(self, worker_id: int, seconds: float) -> None:
+        with self._lock:
+            self._active[worker_id] = seconds
+            self._draw()
+
+    def done(self, worker_id: int, segment_seconds: float) -> None:
+        with self._lock:
+            self._active.pop(worker_id, None)
+            self._completed += segment_seconds
+            self._draw()
+
+    def finish(self) -> None:
+        elapsed = time.monotonic() - self._start
+        print(
+            f"\r  [{'█' * 30}] 100%  {_fmt_time(elapsed)} total{' ' * 20}",
+            file=sys.stderr,
+        )
+
+    def _draw(self) -> None:
+        current = self._completed + sum(self._active.values())
+        pct = min(current / self._total, 1.0)
+        elapsed = time.monotonic() - self._start
+        filled = int(30 * pct)
+        bar = "█" * filled + "░" * (30 - filled)
+        if pct > 0.02 and elapsed > 1:
+            eta = _fmt_time(elapsed / pct * (1 - pct))
+        else:
+            eta = "--:--"
+        print(
+            f"\r  [{bar}] {pct:4.0%}  {_fmt_time(elapsed)} elapsed  ETA {eta}  ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _run_with_progress(
+    cmd: list[str],
+    duration: float,
+    bar: _ProgressBar,
+    worker_id: int = 0,
+) -> None:
+    """Run ffmpeg with -progress pipe:1, feeding updates to the bar."""
+    cmd = list(cmd)
+    try:
+        idx = cmd.index("-loglevel") + 2
+    except ValueError:
+        idx = 1
+    cmd[idx:idx] = ["-progress", "pipe:1"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        if line.startswith("out_time_us="):
+            try:
+                us = int(line.split("=", 1)[1])
+                if us >= 0:
+                    bar.update(worker_id, us / 1_000_000)
+            except (ValueError, IndexError):
+                pass
+    proc.wait()
+    bar.done(worker_id, duration)
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.read() if proc.stderr else ""
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr_text)
 
 
 def ffprobe_clip(path: Path, ffprobe_bin: str) -> ClipProbe:
@@ -544,6 +628,7 @@ def run_single_pass_pipeline(
     fps_expr: str,
     selected_audio_any: bool,
     selected_audio_all: bool,
+    total_duration: float = 0.0,
 ) -> None:
     work_dir.mkdir(parents=True, exist_ok=True)
     front_list_path = work_dir / "front_concat.txt"
@@ -566,7 +651,12 @@ def run_single_pass_pipeline(
     )
 
     print("Building final output with single-pass pipeline...")
-    run_command(cmd, args.dry_run)
+    if args.dry_run:
+        run_command(cmd, True)
+    else:
+        bar = _ProgressBar(total_duration)
+        _run_with_progress(cmd, total_duration, bar)
+        bar.finish()
 
     if not args.keep_temp and not args.dry_run:
         if front_list_path.exists():
@@ -626,19 +716,31 @@ def run_segment_pipeline(
         )
         tasks.append((index, pair, cmd))
 
-    def _encode_segment(task: tuple[int, ClipPair, list[str]]) -> None:
-        idx, p, c = task
-        print(f"[{idx}/{total}] Building stacked segment for {p.timestamp}")
-        run_command(c, args.dry_run)
-
     effective_workers = min(workers, total)
-    if effective_workers > 1 and not args.dry_run:
-        print(f"Encoding {total} segments with {effective_workers} parallel workers...")
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            list(executor.map(_encode_segment, tasks))
+    if args.dry_run:
+        for idx, pair, cmd in tasks:
+            print(f"[{idx}/{total}] Building stacked segment for {pair.timestamp}")
+            run_command(cmd, True)
     else:
-        for task in tasks:
-            _encode_segment(task)
+        total_dur = sum(probe(p.front).duration for _, p, _ in tasks)
+        bar = _ProgressBar(total_dur)
+        if effective_workers > 1:
+            print(f"Encoding {total} segments with {effective_workers} parallel workers...")
+        else:
+            print(f"Encoding {total} segments...")
+
+        def _encode(task: tuple[int, ClipPair, list[str]]) -> None:
+            idx, pair, cmd = task
+            seg_dur = probe(pair.front).duration
+            _run_with_progress(cmd, seg_dur, bar, worker_id=idx)
+
+        if effective_workers > 1:
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                list(executor.map(_encode, tasks))
+        else:
+            for task in tasks:
+                _encode(task)
+        bar.finish()
 
     write_concat_file(concat_list_path, segment_paths)
     concat_cmd = [
@@ -812,6 +914,9 @@ def _main() -> int:
         if effective_workers_est > 1:
             args.encode_threads = max(1, (os.cpu_count() or 4) // effective_workers_est)
 
+    # Estimate total output duration for progress bar.
+    total_duration = front_probe.duration * len(pairs)
+
     print(f"Input directory: {input_dir}")
     print(f"Pairs selected: {len(pairs)}")
     print(f"Target panel width: {target_width}")
@@ -875,6 +980,7 @@ def _main() -> int:
                 fps_expr=fps_expr,
                 selected_audio_any=selected_audio_any,
                 selected_audio_all=selected_audio_all,
+                total_duration=total_duration,
             )
         else:
             if len(pairs) == 1:
@@ -950,6 +1056,7 @@ def _main() -> int:
                         fps_expr=fps_expr,
                         selected_audio_any=selected_audio_any,
                         selected_audio_all=selected_audio_all,
+                        total_duration=total_duration,
                     )
                 except subprocess.CalledProcessError as exc:
                     if args.dry_run:
