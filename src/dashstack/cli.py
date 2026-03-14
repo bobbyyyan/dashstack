@@ -638,7 +638,7 @@ def run_segment_pipeline(
             pass
 
 
-def main() -> int:
+def _main() -> int:
     args = parse_args()
 
     input_dir = args.input_dir.resolve()
@@ -886,5 +886,10 @@ def main() -> int:
     return 0
 
 
+def main() -> int:
+    """Entry point that wraps _main and translates return code to sys.exit."""
+    sys.exit(_main())
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

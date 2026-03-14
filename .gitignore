@@ -10,3 +10,9 @@ __pycache__/
 
 # DashStack working directory
 .dashstack_work/
+
+# Build / packaging
+dist/
+build/
+*.egg-info/
+src/*.egg-info/

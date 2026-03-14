@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dashstack"
+version = "0.1.0"
+description = "Stack front/rear dashcam clips and concatenate chronologically"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+
+[project.scripts]
+dashstack = "dashstack.cli:main"
+
+[project.urls]
+Repository = "https://github.com/bobby/dashstack"

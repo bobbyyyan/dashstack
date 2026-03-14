@@ -12,45 +12,44 @@ Then it concatenates all stacked segments in chronological order.
 - `ffmpeg` and `ffprobe` available in your shell
 - Python 3.9+
 
-## Usage
-
-From this directory:
+## Installation
 
 ```bash
-chmod +x dashstack.py
-./dashstack.py
+pip install .
 ```
 
-Default behavior (`./dashstack.py`) uses the fastest compatible pipeline automatically and writes `dashstack.mp4`.
-In `auto` mode it prefers single-pass processing for multi-pair runs and uses segment mode when needed for compatibility.
+Or install in development/editable mode:
+
+```bash
+pip install -e .
+```
+
+After installing, the `dashstack` command is available globally.
+
+## Usage
+
+```bash
+dashstack
+```
+
+By default, DashStack auto-detects the fastest hardware encoder and decoder on your system and writes `dashstack.mp4`.
 
 Custom output path:
 
 ```bash
-./dashstack.py --output merged_drive.mp4 --overwrite
-```
-
-Faster run on macOS (hardware encoding with VideoToolbox, if supported on your system):
-
-```bash
-./dashstack.py \
-  --video-codec h264_videotoolbox \
-  --video-bitrate 16M \
-  --target-width 1920 \
-  --output merged_drive_fast.mp4 \
-  --overwrite
+dashstack --output merged_drive.mp4 --overwrite
 ```
 
 Quick test with first 2 clip pairs:
 
 ```bash
-./dashstack.py --limit 2 --output sample.mp4 --overwrite
+dashstack --limit 2 --output sample.mp4 --overwrite
 ```
 
 Dry run (prints ffmpeg commands without executing):
 
 ```bash
-./dashstack.py --dry-run
+dashstack --dry-run
 ```
 
 ## Useful options
@@ -60,7 +59,7 @@ Dry run (prints ffmpeg commands without executing):
 - `--work-dir PATH`: temp files directory (default `.dashstack_work`)
 - `--pipeline auto|single-pass|segment`: processing strategy (default `auto`)
 - `--target-width N`: panel width for each camera stream
-- `--video-codec NAME`: output codec for stacked segments (`libx264` default)
+- `--video-codec NAME`: output codec for stacked segments (default: `auto`)
 - `--video-bitrate RATE`: bitrate for non-`libx264` codecs (example: `16M`)
 - `--missing skip|error`: how to handle unmatched timestamps (default `skip`)
 - `--audio-source front|rear|none`: audio source per segment (default `front`)
