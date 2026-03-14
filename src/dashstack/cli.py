@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -57,13 +58,11 @@ class MergedClip:
 Segment = Union[ClipPair, MergedClip]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "DashStack: discover dashcam clips, stack front over rear for each timestamp, "
-            "then concatenate in chronological order."
-        )
-    )
+_SUBCOMMANDS = {"upload"}
+
+
+def _add_stack_args(parser: argparse.ArgumentParser) -> None:
+    """Add all stacking-related arguments to *parser*."""
     parser.add_argument(
         "input_dir",
         nargs="?",
@@ -202,7 +201,67 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete source _F/_R files that are covered by _FR output files.",
     )
-    return parser.parse_args()
+
+
+def _add_upload_args(parser: argparse.ArgumentParser) -> None:
+    """Add upload-related arguments to *parser*."""
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="Files to upload followed by the rsync destination (e.g. host:/path).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what rsync would do without transferring.",
+    )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete source files after successful upload.",
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    # If the first positional arg isn't a known subcommand, treat the
+    # invocation as the default "stack" command so that the existing
+    # `dashstack videos` form keeps working.
+    argv = sys.argv[1:]
+    if not argv or argv[0] not in _SUBCOMMANDS and not argv[0].startswith("-"):
+        # Could be `dashstack videos ...` or `dashstack --dry-run ...`
+        # → default to stack.
+        pass  # fall through to stack parser
+    elif argv[0] in _SUBCOMMANDS:
+        # Explicit subcommand — let the subparser dispatch handle it.
+        parser = argparse.ArgumentParser(
+            prog="dashstack",
+            description="DashStack: dashcam clip stacking and utilities.",
+        )
+        sub = parser.add_subparsers(dest="command")
+        upload_p = sub.add_parser(
+            "upload",
+            help="Upload files to a remote destination via rsync.",
+        )
+        _add_upload_args(upload_p)
+        # Also register stack so --help shows it.
+        stack_p = sub.add_parser(
+            "stack",
+            help="Stack front/rear dashcam clips (default command).",
+        )
+        _add_stack_args(stack_p)
+        return parser.parse_args(argv)
+
+    # Default: stack command.
+    parser = argparse.ArgumentParser(
+        description=(
+            "DashStack: discover dashcam clips, stack front over rear for each timestamp, "
+            "then concatenate in chronological order."
+        )
+    )
+    _add_stack_args(parser)
+    args = parser.parse_args(argv)
+    args.command = None  # signals stack mode
+    return args
 
 
 def eprint(message: str) -> None:
@@ -1125,8 +1184,7 @@ def _clean_source_files(input_dir: Path, dry_run: bool) -> int:
     return len(to_delete)
 
 
-def _main() -> int:
-    args = parse_args()
+def _main(args: argparse.Namespace) -> int:
 
     input_dir = args.input_dir.resolve()
     split_mode = args.output is None
@@ -1523,9 +1581,119 @@ def _main() -> int:
     return 0
 
 
+def _fmt_bytes(n: int) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f}{unit}" if unit != "B" else f"{n}{unit}"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.1f}PB"
+
+
+# Matches rsync -P completion line, e.g.:
+#     85983232 100%   31.19MB/s    0:00:02 (xfer#1, to-check=25/26)
+_RSYNC_XFER_RE = re.compile(
+    r"^\s+(?P<bytes>\d+)\s+100%\s+.*\(xfer#(?P<n>\d+),\s*to-check=(?P<remain>\d+)/(?P<total>\d+)\)"
+)
+
+
+def _upload(args: argparse.Namespace) -> int:
+    """Upload files to a remote destination via rsync over SSH."""
+    if len(args.paths) < 2:
+        eprint("Need at least one file and a destination.")
+        eprint("Usage: dashstack upload [--dry-run] [--delete] <files...> <destination>")
+        return 1
+
+    destination = args.paths[-1]
+    file_args = args.paths[:-1]
+
+    files: list[Path] = []
+    for f in file_args:
+        p = Path(f)
+        if p.exists():
+            files.append(p)
+        else:
+            eprint(f"Warning: {f} does not exist, skipping.")
+
+    if not files:
+        eprint("No valid files to upload.")
+        return 1
+
+    rsync = shutil.which("rsync")
+    if rsync is None:
+        eprint("rsync not found on PATH.")
+        return 1
+
+    total_bytes = sum(f.stat().st_size for f in files)
+    cmd = [rsync, "-avP"]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    cmd += [str(f) for f in files]
+    cmd.append(destination)
+
+    printable = shlex.join(cmd)
+    print(f"$ {printable}")
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
+
+    bytes_done = 0
+    start = time.monotonic()
+
+    for line in proc.stdout:
+        m = _RSYNC_XFER_RE.match(line)
+        if m:
+            bytes_done += int(m.group("bytes"))
+            pct = min(bytes_done / total_bytes, 1.0) if total_bytes else 1.0
+            elapsed = time.monotonic() - start
+            filled = int(30 * pct)
+            bar = "█" * filled + "░" * (30 - filled)
+            if pct > 0.02 and elapsed > 1:
+                eta = _fmt_time(elapsed / pct * (1 - pct))
+            else:
+                eta = "--:--"
+            print(
+                f"\r  [{bar}] {pct:4.0%}  {_fmt_bytes(bytes_done)}/{_fmt_bytes(total_bytes)}"
+                f"  {_fmt_time(elapsed)} elapsed  ETA {eta}  ",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    proc.wait()
+
+    if total_bytes and not args.dry_run:
+        elapsed = time.monotonic() - start
+        print(
+            f"\r  [{'█' * 30}] 100%  {_fmt_bytes(total_bytes)}/{_fmt_bytes(total_bytes)}"
+            f"  {_fmt_time(elapsed)} total{' ' * 20}",
+            file=sys.stderr,
+        )
+
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.read() if proc.stderr else ""
+        eprint(f"\nrsync failed with exit code {proc.returncode}")
+        if stderr_text.strip():
+            eprint(stderr_text.strip())
+        return proc.returncode
+
+    if args.delete and not args.dry_run:
+        print(f"\nDeleting {len(files)} source file(s)...")
+        for f in files:
+            f.unlink()
+            print(f"  Deleted {f}")
+
+    print("Upload complete.")
+    return 0
+
+
 def main() -> int:
     """Entry point that wraps _main and translates return code to sys.exit."""
-    sys.exit(_main())
+    args = parse_args()
+    if args.command == "upload":
+        sys.exit(_upload(args))
+    else:
+        sys.exit(_main(args))
 
 
 if __name__ == "__main__":
