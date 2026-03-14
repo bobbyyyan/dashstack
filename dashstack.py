@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -78,10 +80,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--video-codec",
-        default="libx264",
+        default="auto",
         help=(
-            "Video codec for stacked segments (default: libx264). "
-            "Use h264_videotoolbox on macOS for much faster hardware encoding."
+            "Video encoder (default: auto). Auto-detects fastest available encoder: "
+            "h264_videotoolbox (macOS), h264_nvenc (NVIDIA), h264_vaapi (Linux), "
+            "or libx264 software fallback. Pass an explicit name to override."
         ),
     )
     parser.add_argument(
@@ -146,6 +149,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing output file if present.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of parallel ffmpeg workers for segment mode "
+            "(default: half of CPU cores, capped at 4)."
+        ),
+    )
+    parser.add_argument(
+        "--hwaccel",
+        default="auto",
+        help=(
+            "Hardware-accelerated decoding (default: auto). Auto-detects best method: "
+            "videotoolbox (macOS), cuda (NVIDIA), vaapi (Linux), or none (software fallback). "
+            "Pass 'none' to force software decoding."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -202,6 +223,48 @@ def ffprobe_clip(path: Path, ffprobe_bin: str) -> ClipProbe:
         duration=duration_float,
         has_audio=has_audio,
     )
+
+
+def detect_hwaccel(ffmpeg_bin: str) -> str:
+    """Auto-detect the best available hardware decoding method."""
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-hwaccels"],
+            capture_output=True, text=True, timeout=10,
+        )
+        available = {
+            line.strip().lower()
+            for line in result.stdout.strip().splitlines()[1:]
+            if line.strip()
+        }
+        for method in ["videotoolbox", "cuda", "vaapi", "qsv", "d3d11va", "dxva2"]:
+            if method in available:
+                return method
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "none"
+
+
+def detect_video_codec(ffmpeg_bin: str) -> str:
+    """Auto-detect the fastest available H.264 encoder."""
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        output = result.stdout
+        for encoder in [
+            "h264_videotoolbox",
+            "h264_nvenc",
+            "h264_amf",
+            "h264_vaapi",
+            "h264_qsv",
+        ]:
+            if re.search(rf"^\s*V\S*\s+{re.escape(encoder)}\s", output, re.MULTILINE):
+                return encoder
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "libx264"
 
 
 def ensure_even(value: int) -> int:
@@ -279,6 +342,15 @@ def build_video_encode_args(args: argparse.Namespace) -> list[str]:
     return codec_args
 
 
+def _hwaccel_input(args: argparse.Namespace, path: str) -> list[str]:
+    """Return ffmpeg flags for one input: optional hwaccel + -i <path>."""
+    flags: list[str] = []
+    if args.hwaccel != "none":
+        flags.extend(["-hwaccel", args.hwaccel])
+    flags.extend(["-i", path])
+    return flags
+
+
 def write_concat_file(path: Path, clips: list[Path]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for clip in clips:
@@ -310,15 +382,15 @@ def build_segment_command(
         "-loglevel",
         "error",
         "-y",
-        "-i",
-        str(pair.front),
-        "-i",
-        str(pair.rear),
+    ]
+    cmd.extend(_hwaccel_input(args, str(pair.front)))
+    cmd.extend(_hwaccel_input(args, str(pair.rear)))
+    cmd.extend([
         "-filter_complex",
         filter_complex,
         "-map",
         "[v]",
-    ]
+    ])
     cmd.extend(build_video_encode_args(args))
 
     if args.audio_source == "none":
@@ -374,23 +446,21 @@ def build_single_pass_command(
         "-loglevel",
         "error",
         "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(front_list_path),
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(rear_list_path),
+    ]
+    if args.hwaccel != "none":
+        cmd.extend(["-hwaccel", args.hwaccel])
+    cmd.extend([
+        "-f", "concat", "-safe", "0", "-i", str(front_list_path),
+    ])
+    if args.hwaccel != "none":
+        cmd.extend(["-hwaccel", args.hwaccel])
+    cmd.extend([
+        "-f", "concat", "-safe", "0", "-i", str(rear_list_path),
         "-filter_complex",
         filter_complex,
         "-map",
         "[v]",
-    ]
+    ])
     cmd.extend(build_video_encode_args(args))
 
     if args.audio_source == "none":
@@ -482,6 +552,7 @@ def run_segment_pipeline(
     front_panel_h: int,
     rear_panel_h: int,
     fps_expr: str,
+    workers: int = 1,
 ) -> None:
     segments_dir = work_dir / "segments"
     concat_list_path = work_dir / "segments.txt"
@@ -492,7 +563,10 @@ def run_segment_pipeline(
     if concat_list_path.exists():
         concat_list_path.unlink()
 
+    # Pre-build all segment commands so we can run them in parallel.
     segment_paths: list[Path] = []
+    tasks: list[tuple[int, ClipPair, list[str]]] = []
+    total = len(pairs)
     for index, pair in enumerate(pairs, start=1):
         segment_path = segments_dir / f"segment_{index:05d}_{pair.timestamp}.mp4"
         segment_paths.append(segment_path)
@@ -512,8 +586,21 @@ def run_segment_pipeline(
             fps_expr=fps_expr,
             selected_has_audio=selected_has_audio,
         )
-        print(f"[{index}/{len(pairs)}] Building stacked segment for {pair.timestamp}")
-        run_command(cmd, args.dry_run)
+        tasks.append((index, pair, cmd))
+
+    def _encode_segment(task: tuple[int, ClipPair, list[str]]) -> None:
+        idx, p, c = task
+        print(f"[{idx}/{total}] Building stacked segment for {p.timestamp}")
+        run_command(c, args.dry_run)
+
+    effective_workers = min(workers, total)
+    if effective_workers > 1 and not args.dry_run:
+        print(f"Encoding {total} segments with {effective_workers} parallel workers...")
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            list(executor.map(_encode_segment, tasks))
+    else:
+        for task in tasks:
+            _encode_segment(task)
 
     write_concat_file(concat_list_path, segment_paths)
     concat_cmd = [
@@ -558,13 +645,48 @@ def main() -> int:
     output_path = args.output.resolve()
     work_dir = args.work_dir.resolve()
 
+    workers = args.workers
+    if workers is None:
+        workers = max(1, min((os.cpu_count() or 4) // 2, 4))
+
+    codec_auto = args.video_codec == "auto"
+    if codec_auto:
+        args.video_codec = detect_video_codec(args.ffmpeg_bin)
+
+    hwaccel_auto = args.hwaccel == "auto"
+    if hwaccel_auto:
+        args.hwaccel = detect_hwaccel(args.ffmpeg_bin)
+
     if not input_dir.exists() or not input_dir.is_dir():
         eprint(f"Input directory does not exist or is not a directory: {input_dir}")
         return 1
 
     if output_path.exists() and not args.overwrite:
-        eprint(f"Output already exists: {output_path} (pass --overwrite to replace it)")
-        return 1
+        # Find the next available filename for the rename option.
+        stem = output_path.stem
+        suffix = output_path.suffix
+        parent = output_path.parent
+        counter = 1
+        candidate = parent / f"{stem}_{counter}{suffix}"
+        while candidate.exists():
+            counter += 1
+            candidate = parent / f"{stem}_{counter}{suffix}"
+
+        print(f"Output file already exists: {output_path.name}")
+        print(f"  [o] Overwrite")
+        print(f"  [r] Rename to {candidate.name}")
+        print(f"  [q] Quit")
+        try:
+            choice = input("Choice [o/r/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        if choice == "o":
+            pass  # proceed with existing output_path
+        elif choice == "r":
+            output_path = candidate
+        else:
+            return 1
 
     pairs, unmatched = discover_pairs(input_dir)
     if unmatched:
@@ -594,6 +716,21 @@ def main() -> int:
             probe_cache[path] = ffprobe_clip(path, args.ffprobe_bin)
         return probe_cache[path]
 
+    # Collect all unique files that need probing and probe them in parallel.
+    files_to_probe: list[Path] = [pairs[0].front, pairs[0].rear]
+    if args.audio_source != "none":
+        for pair in pairs:
+            files_to_probe.append(pair.front if args.audio_source == "front" else pair.rear)
+    unique_probe_files = list(dict.fromkeys(files_to_probe))
+
+    if len(unique_probe_files) > 2 and workers > 1:
+        print(f"Probing {len(unique_probe_files)} clips ({workers} parallel)...")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(probe, unique_probe_files))
+    else:
+        for f in unique_probe_files:
+            probe(f)
+
     first_pair = pairs[0]
     front_probe = probe(first_pair.front)
     rear_probe = probe(first_pair.rear)
@@ -622,7 +759,8 @@ def main() -> int:
     print(f"Rear panel: {target_width}x{rear_panel_h}")
     print(f"Output FPS: {fps_expr}")
     print(f"Pipeline mode: {args.pipeline}")
-    print(f"Video codec: {args.video_codec}")
+    codec_label = f"{args.video_codec} (detected)" if codec_auto else args.video_codec
+    print(f"Video codec: {codec_label}")
     if args.video_codec == "libx264":
         print(f"x264 preset/crf: {args.preset}/{args.crf}")
     else:
@@ -635,6 +773,10 @@ def main() -> int:
             print("Audio availability: absent in all selected clips (silence will be generated)")
         else:
             print("Audio availability: mixed across selected clips")
+    if args.hwaccel != "none":
+        hwaccel_label = f"{args.hwaccel} (detected)" if hwaccel_auto else args.hwaccel
+        print(f"HW decode: {hwaccel_label}")
+    print(f"Workers: {workers}")
     print(f"Work directory: {work_dir}")
     print(f"Output file: {output_path}")
 
@@ -651,6 +793,7 @@ def main() -> int:
                 front_panel_h=front_panel_h,
                 rear_panel_h=rear_panel_h,
                 fps_expr=fps_expr,
+                workers=workers,
             )
         elif args.pipeline == "single-pass":
             print("Pipeline selected: single-pass")
@@ -679,6 +822,7 @@ def main() -> int:
                     front_panel_h=front_panel_h,
                     rear_panel_h=rear_panel_h,
                     fps_expr=fps_expr,
+                    workers=workers,
                 )
             elif args.audio_source != "none" and selected_audio_any and not selected_audio_all:
                 print(
@@ -695,6 +839,7 @@ def main() -> int:
                     front_panel_h=front_panel_h,
                     rear_panel_h=rear_panel_h,
                     fps_expr=fps_expr,
+                    workers=workers,
                 )
             else:
                 print("Pipeline selected: single-pass (fast default)")
@@ -728,6 +873,7 @@ def main() -> int:
                         front_panel_h=front_panel_h,
                         rear_panel_h=rear_panel_h,
                         fps_expr=fps_expr,
+                        workers=workers,
                     )
     except subprocess.CalledProcessError as exc:
         eprint(f"Command failed with exit code {exc.returncode}")
