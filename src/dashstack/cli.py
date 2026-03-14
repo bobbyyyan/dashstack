@@ -58,7 +58,7 @@ class MergedClip:
 Segment = Union[ClipPair, MergedClip]
 
 
-_SUBCOMMANDS = {"upload", "download"}
+_SUBCOMMANDS = {"upload", "download", "dedup"}
 
 
 def _add_stack_args(parser: argparse.ArgumentParser) -> None:
@@ -246,6 +246,37 @@ def _add_download_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_dedup_args(parser: argparse.ArgumentParser) -> None:
+    """Add dedup-related arguments to *parser*."""
+    parser.add_argument(
+        "files",
+        nargs="+",
+        type=Path,
+        help="Video files to deduplicate.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show duplicate regions without modifying files.",
+    )
+    parser.add_argument(
+        "--max-overlap",
+        type=int,
+        default=30,
+        help="Maximum overlap to search for in seconds (default: 30).",
+    )
+    parser.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="ffmpeg executable name or path.",
+    )
+    parser.add_argument(
+        "--ffprobe-bin",
+        default="ffprobe",
+        help="ffprobe executable name or path.",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     # If the first positional arg isn't a known subcommand, treat the
     # invocation as the default "stack" command so that the existing
@@ -272,6 +303,11 @@ def parse_args() -> argparse.Namespace:
             help="Download files from a remote source via rsync.",
         )
         _add_download_args(download_p)
+        dedup_p = sub.add_parser(
+            "dedup",
+            help="Find and remove duplicate portions in merged videos.",
+        )
+        _add_dedup_args(dedup_p)
         # Also register stack so --help shows it.
         stack_p = sub.add_parser(
             "stack",
@@ -1845,6 +1881,219 @@ def _run_rsync_with_progress(cmd: list[str], total_bytes: int | None = None) -> 
     return proc.returncode
 
 
+def _frame_mad(a: bytes, b: bytes, max_mad: float = 256.0) -> float:
+    """Mean absolute difference between two grayscale frame byte arrays.
+
+    Bails out early if the running total exceeds *max_mad* per pixel.
+    """
+    total = 0
+    n = len(a)
+    cutoff = int(max_mad * n)
+    for i in range(n):
+        total += abs(a[i] - b[i])
+        if total > cutoff:
+            return 256.0
+    return total / n
+
+
+def _find_duplicate_regions(
+    frames: list[bytes],
+    fps: int,
+    max_overlap_secs: int,
+) -> list[tuple[float, float]]:
+    """Find duplicate regions using cut-point detection and verification.
+
+    Real duplicates occur at clip boundaries: there's an abrupt frame
+    change (a cut), and the footage after the cut matches footage from
+    a few seconds before it.  This avoids false positives from
+    naturally similar dashcam footage.
+
+    Returns list of (start_seconds, duration_seconds) for each duplicate.
+    """
+    if len(frames) < 3:
+        return []
+
+    # Step 1: Compute consecutive frame differences.
+    diffs = [_frame_mad(frames[t], frames[t - 1]) for t in range(1, len(frames))]
+
+    # Step 2: Find cut points — frames where the difference from the
+    # previous frame is significantly higher than the local norm.
+    sorted_diffs = sorted(diffs)
+    median_diff = sorted_diffs[len(sorted_diffs) // 2]
+    cut_threshold = max(median_diff * 3, 15.0)
+
+    cut_points = [t + 1 for t, d in enumerate(diffs) if d > cut_threshold]
+
+    # Step 3: At each cut point, look for a matching offset where the
+    # footage after the cut repeats footage from before it.
+    max_offset = max_overlap_secs * fps
+    match_threshold = 8.0  # strict — actual dups are near-identical
+    min_match = max(2, fps)  # at least ~1 second of sustained match
+
+    regions: list[tuple[float, float]] = []
+    skip_until = 0
+
+    for cp in cut_points:
+        if cp < skip_until:
+            continue
+
+        best_len = 0
+
+        for d in range(fps, min(max_offset + 1, cp + 1)):
+            if _frame_mad(frames[cp], frames[cp - d], match_threshold) > match_threshold:
+                continue
+
+            # Count how many consecutive frames match at this offset.
+            match_len = 1
+            while (
+                cp + match_len < len(frames)
+                and cp - d + match_len < cp
+                and _frame_mad(
+                    frames[cp + match_len],
+                    frames[cp - d + match_len],
+                    match_threshold,
+                )
+                <= match_threshold
+            ):
+                match_len += 1
+
+            if match_len >= min_match and match_len > best_len:
+                best_len = match_len
+
+        if best_len > 0:
+            regions.append((cp / fps, best_len / fps))
+            skip_until = cp + best_len
+
+    return regions
+
+
+def _dedup(args: argparse.Namespace) -> int:
+    """Find and remove duplicate portions in merged videos."""
+    rc = 0
+    for video_path in args.files:
+        if not video_path.exists():
+            eprint(f"{video_path}: not found")
+            rc = 1
+            continue
+
+        print(f"\nAnalyzing {video_path.name}...")
+
+        clip = ffprobe_clip(video_path, args.ffprobe_bin)
+
+        # Extract small grayscale thumbnails at 1fps for comparison.
+        # Use CUDA decoding when available for faster extraction.
+        thumb_w, thumb_h = 32, 24
+        frame_size = thumb_w * thumb_h
+        fps = 1
+        hwaccel = detect_hwaccel(args.ffmpeg_bin)
+        cmd = [args.ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
+        if hwaccel != "none":
+            cmd.extend(["-hwaccel", hwaccel])
+        cmd.extend([
+            "-i",
+            str(video_path),
+            "-vf",
+            f"fps={fps},scale={thumb_w}:{thumb_h},format=gray",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "pipe:1",
+        ])
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            eprint(f"  Failed to extract frames: {result.stderr.decode().strip()}")
+            rc = 1
+            continue
+
+        raw = result.stdout
+        frames: list[bytes] = []
+        for i in range(0, len(raw) - frame_size + 1, frame_size):
+            frames.append(raw[i : i + frame_size])
+
+        print(f"  Extracted {len(frames)} frames ({_fmt_time(clip.duration)} video)")
+
+        regions = _find_duplicate_regions(frames, fps, args.max_overlap)
+
+        if not regions:
+            print("  No duplicate regions found.")
+            continue
+
+        total_dup = sum(dur for _, dur in regions)
+        print(f"  Found {len(regions)} duplicate region(s) ({total_dup:.1f}s total):")
+        for start, dur in regions:
+            print(f"    {_fmt_time(start)} ({dur:.1f}s)")
+
+        if args.dry_run:
+            continue
+
+        # Build good (non-duplicate) sections.
+        good_sections: list[tuple[float, float]] = []
+        pos = 0.0
+        for start, dur in regions:
+            if start > pos:
+                good_sections.append((pos, start))
+            pos = start + dur
+        if pos < clip.duration:
+            good_sections.append((pos, clip.duration))
+
+        # Write concat file with inpoint/outpoint to skip duplicates.
+        work_dir = video_path.parent / ".dashstack_work" / f"dedup_{os.getpid()}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        concat_path = work_dir / "dedup_concat.txt"
+
+        with concat_path.open("w", encoding="utf-8") as f:
+            for sect_start, sect_end in good_sections:
+                f.write(f"file '{escape_concat_path(video_path.resolve())}'\n")
+                f.write(f"inpoint {sect_start:.6f}\n")
+                f.write(f"outpoint {sect_end:.6f}\n")
+
+        temp_output = work_dir / video_path.name
+        concat_cmd = [
+            args.ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-c",
+            "copy",
+            str(temp_output),
+        ]
+        print("  Removing duplicate regions...")
+        try:
+            subprocess.run(concat_cmd, check=True)
+        except subprocess.CalledProcessError as exc:
+            eprint(f"  ffmpeg failed (exit {exc.returncode})")
+            rc = 1
+            continue
+
+        # Replace original: rename original out, move new in, delete original.
+        backup = video_path.with_suffix(f".dup{video_path.suffix}")
+        video_path.rename(backup)
+        temp_output.rename(video_path)
+        backup.unlink()
+
+        # Cleanup temp files.
+        concat_path.unlink(missing_ok=True)
+        try:
+            work_dir.rmdir()
+            work_dir.parent.rmdir()
+        except OSError:
+            pass
+
+        new_clip = ffprobe_clip(video_path, args.ffprobe_bin)
+        saved = clip.duration - new_clip.duration
+        print(f"  Done. Removed {saved:.1f}s of duplicate footage.")
+
+    return rc
+
+
 def _upload(args: argparse.Namespace) -> int:
     """Upload files to a remote destination via rsync over SSH."""
     if len(args.paths) < 2:
@@ -1923,6 +2172,8 @@ def main() -> int:
         sys.exit(_upload(args))
     elif args.command == "download":
         sys.exit(_download(args))
+    elif args.command == "dedup":
+        sys.exit(_dedup(args))
     else:
         sys.exit(_main(args))
 

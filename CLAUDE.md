@@ -42,6 +42,9 @@ Key flow in `src/dashstack/cli.py`:
 7. **Filename fixing** (`_fix_fr_names`): On every run, automatically probes existing `_FR` files and renames any whose end timestamp is wrong or missing (computed as start + duration).
 8. **Cleanup** (`--clean`): Deletes source `_F`/`_R` files whose timestamps are covered by `_FR` files, and also deletes older `_FR` files that are fully subsumed by a larger `_FR` file.
 
+9. **Overlap trimming** (`_compute_overlaps`): When adjacent segments overlap in time, the earlier segment is truncated. ClipPairs use `-t` during encoding; MergedClips use concat demuxer `duration` directives.
+10. **Dedup** (`dashstack dedup`): Post-hoc duplicate removal for already-merged videos. Extracts small grayscale thumbnails at 1fps, detects cut points (abrupt frame changes), then verifies if footage after each cut matches footage from before it. Removes duplicates via concat demuxer `inpoint`/`outpoint` with stream copy.
+
 Key types: `ClipPair` (F+R source pair), `MergedClip` (existing `_FR` file with start/end timestamps), `Segment = Union[ClipPair, MergedClip]`.
 
 ## Guidelines

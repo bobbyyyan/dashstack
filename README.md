@@ -89,6 +89,18 @@ dashstack download --delete user@host:/path/*.MP4   # delete remote files after 
 dashstack download --dry-run user@host:/path/*.MP4   # preview without transferring
 ```
 
+### `dedup`
+
+Find and remove duplicate portions in already-merged `_FR` videos. This handles videos that were merged before overlap trimming was added, or from any other source with repeated footage at clip boundaries.
+
+Detection works by finding abrupt frame changes (clip boundaries) and verifying that the footage after the cut matches footage from a few seconds before it.
+
+```bash
+dashstack dedup video_FR.MP4                 # fix in-place
+dashstack dedup --dry-run video_FR.MP4       # show duplicates without modifying
+dashstack dedup --max-overlap 30 *.MP4       # search for overlaps up to 30s (default)
+```
+
 ## Stacking options
 
 | Flag | Description |
