@@ -385,14 +385,12 @@ def build_segment_command(
 ) -> list[str]:
     cuda_filters = _use_cuda_filters(args)
     if cuda_filters:
-        total_h = front_panel_h + rear_panel_h
         filter_complex = (
-            f"color=s={target_width}x{total_h}:c=black:r={fps_expr},"
-            f"format=yuv420p,hwupload_cuda[canvas];"
-            f"[0:v]scale_cuda={target_width}:{front_panel_h}:format=yuv420p[top];"
-            f"[canvas][top]overlay_cuda=0:0[mid];"
-            f"[1:v]scale_cuda={target_width}:{rear_panel_h}:format=yuv420p[bot];"
-            f"[mid][bot]overlay_cuda=0:{front_panel_h}[v]"
+            f"[0:v]scale_cuda={target_width}:{front_panel_h}:format=yuv420p,"
+            f"hwdownload,format=yuv420p,setsar=1[top];"
+            f"[1:v]scale_cuda={target_width}:{rear_panel_h}:format=yuv420p,"
+            f"hwdownload,format=yuv420p,setsar=1[bottom];"
+            f"[top][bottom]vstack=inputs=2:shortest=1,fps={fps_expr}[v]"
         )
     else:
         filter_complex = (
@@ -461,14 +459,12 @@ def build_single_pass_command(
 ) -> list[str]:
     cuda_filters = _use_cuda_filters(args)
     if cuda_filters:
-        total_h = front_panel_h + rear_panel_h
         filter_complex = (
-            f"color=s={target_width}x{total_h}:c=black:r={fps_expr},"
-            f"format=yuv420p,hwupload_cuda[canvas];"
-            f"[0:v]scale_cuda={target_width}:{front_panel_h}:format=yuv420p[top];"
-            f"[canvas][top]overlay_cuda=0:0[mid];"
-            f"[1:v]scale_cuda={target_width}:{rear_panel_h}:format=yuv420p[bot];"
-            f"[mid][bot]overlay_cuda=0:{front_panel_h}[v]"
+            f"[0:v]scale_cuda={target_width}:{front_panel_h}:format=yuv420p,"
+            f"hwdownload,format=yuv420p,setsar=1[top];"
+            f"[1:v]scale_cuda={target_width}:{rear_panel_h}:format=yuv420p,"
+            f"hwdownload,format=yuv420p,setsar=1[bottom];"
+            f"[top][bottom]vstack=inputs=2:shortest=1,fps={fps_expr}[v]"
         )
     else:
         filter_complex = (
@@ -851,7 +847,7 @@ def _main() -> int:
         hwaccel_label = f"{args.hwaccel} (detected)" if hwaccel_auto else args.hwaccel
         print(f"HW decode: {hwaccel_label}")
     if _use_cuda_filters(args):
-        print("GPU filters: scale_cuda + overlay_cuda (full CUDA pipeline)")
+        print("GPU filters: CUDA decode + scale_cuda + NVENC encode")
     print(f"Workers: {workers}")
     print(f"Work directory: {work_dir}")
     print(f"Output file: {output_path}")
