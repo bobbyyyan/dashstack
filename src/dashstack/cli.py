@@ -533,6 +533,86 @@ def _fr_output_path(run: list[Segment], input_dir: Path) -> Path:
     return input_dir / name
 
 
+def _seg_duration(seg: Segment, probe: Callable[[Path], ClipProbe]) -> float:
+    """Return probed duration of a segment."""
+    return probe(seg.path if isinstance(seg, MergedClip) else seg.front).duration
+
+
+def _print_split_plan(
+    runs: list[list[Segment]],
+    probe: Callable[[Path], ClipProbe],
+    input_dir: Path,
+) -> None:
+    """Print a visual map of clips grouped into _FR output files."""
+    total_pairs = sum(sum(1 for s in r if isinstance(s, ClipPair)) for r in runs)
+    total_merged = sum(sum(1 for s in r if isinstance(s, MergedClip)) for r in runs)
+
+    entry_parts = []
+    if total_pairs:
+        entry_parts.append(f"{total_pairs} pair{'s' if total_pairs != 1 else ''}")
+    if total_merged:
+        entry_parts.append(f"{total_merged} existing")
+    print(
+        f"\n{' + '.join(entry_parts)}"
+        f" → {len(runs)} output file{'s' if len(runs) != 1 else ''}\n"
+    )
+
+    clip_num = 0
+    collapse_threshold = 6
+    show_head = 3
+    show_tail = 1
+
+    for ri, run in enumerate(runs):
+        fr_path = _fr_output_path(run, input_dir)
+
+        run_dur = sum(_seg_duration(s, probe) for s in run)
+        n_pairs = sum(1 for s in run if isinstance(s, ClipPair))
+        n_merged = sum(1 for s in run if isinstance(s, MergedClip))
+
+        # Header
+        print(f"  ┌ {fr_path.name}")
+
+        # Clips (collapse large runs)
+        collapse = len(run) > collapse_threshold
+        for si, seg in enumerate(run):
+            clip_num += 1
+            ts = _seg_start_ts(seg)
+            dur = _seg_duration(seg, probe)
+
+            if collapse and show_head <= si < len(run) - show_tail:
+                if si == show_head:
+                    hidden = len(run) - show_head - show_tail
+                    print(f"  │       ⋮ ({hidden} more)")
+                continue
+
+            suffix = ""
+            if isinstance(seg, MergedClip):
+                suffix = f"  ← {seg.path.name}"
+
+            print(f"  │  {clip_num:3d}. {ts}  {dur:3.0f}s{suffix}")
+
+        # Footer
+        parts = []
+        if n_pairs:
+            parts.append(f"{n_pairs} pair{'s' if n_pairs != 1 else ''}")
+        if n_merged:
+            parts.append(f"{n_merged} merged")
+        print(f"  └ {' + '.join(parts)} · {_fmt_time(run_dur)}")
+
+        # Gap to next run
+        if ri < len(runs) - 1:
+            last_end = (
+                _ts_seconds(_seg_start_ts(run[-1]))
+                + _seg_duration(run[-1], probe)
+            )
+            next_start = _ts_seconds(_seg_start_ts(runs[ri + 1][0]))
+            gap = next_start - last_end
+            gap_str = _fmt_time(gap) if gap >= 60 else f"{gap:.0f}s"
+            print(f"                 ┄┄ {gap_str} gap ┄┄")
+
+    print()
+
+
 def _use_cuda_filters(args: argparse.Namespace) -> bool:
     """Return True if full CUDA-accelerated filter graph should be used."""
     return args.hwaccel == "cuda" and "nvenc" in args.video_codec
@@ -1089,42 +1169,43 @@ def _main() -> int:
         for f in unique_probe_files:
             probe(f)
 
-    # Build unified timeline for display and gap analysis.
-    timeline: list[Segment] = []
-    timeline.extend(pairs)
-    timeline.extend(merged_clips)
-    timeline.sort(key=_seg_start_ts)
+    # Compute runs early so we can use them in the visualization.
+    if split_mode:
+        runs = split_into_runs(pairs, merged_clips, probe, args.gap_threshold)
+    else:
+        # Non-split: show chronological clip order with gap analysis.
+        timeline: list[Segment] = []
+        timeline.extend(pairs)
+        timeline.extend(merged_clips)
+        timeline.sort(key=_seg_start_ts)
 
-    print(f"\nChronological clip order ({len(timeline)} entries):")
-    gap_count = 0
-    for i, seg in enumerate(timeline, 1):
-        ts = _seg_start_ts(seg)
-        if isinstance(seg, MergedClip):
-            dur = probe(seg.path).duration
-            label = f"  {i:3d}. {ts} ({dur:.0f}s)  [merged] {seg.path.name}"
-        else:
-            dur = probe(seg.front).duration
-            label = f"  {i:3d}. {ts} ({dur:.0f}s)  F={seg.front.name}  R={seg.rear.name}"
-        if i == 1:
-            gap_label = ""
-        else:
-            prev_seg = timeline[i - 2]
-            prev_ts = _seg_start_ts(prev_seg)
-            if isinstance(prev_seg, MergedClip):
-                prev_dur = probe(prev_seg.path).duration
+        print(f"\nChronological clip order ({len(timeline)} entries):")
+        gap_count = 0
+        for i, seg in enumerate(timeline, 1):
+            ts = _seg_start_ts(seg)
+            if isinstance(seg, MergedClip):
+                dur = probe(seg.path).duration
+                label = f"  {i:3d}. {ts} ({dur:.0f}s)  [merged] {seg.path.name}"
             else:
-                prev_dur = probe(prev_seg.front).duration
-            prev_end = _ts_seconds(prev_ts) + prev_dur
-            gap = _ts_seconds(ts) - prev_end
-            if gap > args.gap_threshold:
-                gap_label = f"  *** gap {gap:.0f}s ***"
-                gap_count += 1
-            else:
+                dur = probe(seg.front).duration
+                label = f"  {i:3d}. {ts} ({dur:.0f}s)  F={seg.front.name}  R={seg.rear.name}"
+            if i == 1:
                 gap_label = ""
-        print(f"{label}{gap_label}")
-    if gap_count:
-        print(f"  ({gap_count} gap{'s' if gap_count != 1 else ''} detected)")
-    print()
+            else:
+                prev_seg = timeline[i - 2]
+                prev_ts = _seg_start_ts(prev_seg)
+                prev_dur = _seg_duration(prev_seg, probe)
+                prev_end = _ts_seconds(prev_ts) + prev_dur
+                gap = _ts_seconds(ts) - prev_end
+                if gap > args.gap_threshold:
+                    gap_label = f"  *** gap {gap:.0f}s ***"
+                    gap_count += 1
+                else:
+                    gap_label = ""
+            print(f"{label}{gap_label}")
+        if gap_count:
+            print(f"  ({gap_count} gap{'s' if gap_count != 1 else ''} detected)")
+        print()
 
     first_pair = pairs[0]
     front_probe = probe(first_pair.front)
@@ -1193,35 +1274,28 @@ def _main() -> int:
     print(f"Workers: {workers}")
     print(f"Work directory: {work_dir}")
     if split_mode:
-        runs = split_into_runs(pairs, merged_clips, probe, args.gap_threshold)
         print(f"Output mode: split ({len(runs)} run{'s' if len(runs) != 1 else ''})")
-        for ri, run in enumerate(runs, 1):
-            fr_path = _fr_output_path(run, input_dir)
-            n_pairs = sum(1 for s in run if isinstance(s, ClipPair))
-            n_merged = sum(1 for s in run if isinstance(s, MergedClip))
-            parts = []
-            if n_pairs:
-                parts.append(f"{n_pairs} pair{'s' if n_pairs != 1 else ''}")
-            if n_merged:
-                parts.append(f"{n_merged} merged")
-            print(f"  Run {ri}: {fr_path.name} ({', '.join(parts)})")
+        _print_split_plan(runs, probe, input_dir)
     else:
         print(f"Output file: {output_path}")
 
     try:
         if split_mode:
-            run_split_pipeline(
-                args=args,
-                runs=runs,
-                probe=probe,
-                input_dir=input_dir,
-                work_dir=work_dir,
-                target_width=target_width,
-                front_panel_h=front_panel_h,
-                rear_panel_h=rear_panel_h,
-                fps_expr=fps_expr,
-                workers=workers,
-            )
+            if args.dry_run:
+                pass  # visualization above is the dry-run output
+            else:
+                run_split_pipeline(
+                    args=args,
+                    runs=runs,
+                    probe=probe,
+                    input_dir=input_dir,
+                    work_dir=work_dir,
+                    target_width=target_width,
+                    front_panel_h=front_panel_h,
+                    rear_panel_h=rear_panel_h,
+                    fps_expr=fps_expr,
+                    workers=workers,
+                )
         else:
             # Single-file mode: build unified segment list.
             all_segments: list[Segment] = []
