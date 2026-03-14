@@ -8,6 +8,7 @@ No external Python dependencies. Just `ffmpeg`.
 
 - Python 3.9+
 - `ffmpeg` and `ffprobe` on PATH
+- `rsync` on PATH (for upload/download subcommands)
 
 ## Installation
 
@@ -27,6 +28,7 @@ pip install -e .
 dashstack videos                  # split mode: one _FR file per continuous run
 dashstack videos --dry-run        # preview the plan without encoding
 dashstack videos --limit 3        # quick test with first 3 pairs
+dashstack videos --clean          # encode, then delete source files covered by output
 ```
 
 ## How it works
@@ -39,12 +41,14 @@ When no `--output` is given, DashStack detects gaps between clips (default >5s) 
 
 ```
 REC_20260313_135042_F.MP4  ┐
-REC_20260313_135042_R.MP4  ┤→ REC_20260313_135042_20260313_135142_FR.MP4
+REC_20260313_135042_R.MP4  ┤→ REC_20260313_135042_20260313_135242_FR.MP4
 REC_20260313_135142_F.MP4  ┤
 REC_20260313_135142_R.MP4  ┘
 ```
 
-On re-runs, existing `_FR` files are detected and reused — source clips already covered by an `_FR` file are skipped, so only new pairs get encoded.
+The end timestamp in `_FR` filenames reflects the actual end time of the video (start of last segment + its duration), not just the last segment's start.
+
+On re-runs, existing `_FR` files are detected and reused — source clips already covered by an `_FR` file are skipped, so only new pairs get encoded. Existing `_FR` filenames are automatically corrected if their end timestamp is wrong or missing.
 
 ### Single-file mode
 
@@ -54,14 +58,45 @@ Combine everything into one file:
 dashstack videos --output combined.mp4
 ```
 
-## Options
+### Cleanup (`--clean`)
+
+The `--clean` flag deletes files that are fully covered by `_FR` output:
+
+- Source `_F`/`_R` clips whose timestamps fall within an `_FR` range
+- Older `_FR` files that are fully subsumed by a newer, larger `_FR` file
+
+This means you can run `dashstack videos --clean` incrementally — as small `_FR` files get merged with new clips into bigger ones, the old `_FR` files are cleaned up too.
+
+## Subcommands
+
+### `upload`
+
+Transfer files to a remote destination via rsync over SSH, with an overall progress bar.
+
+```bash
+dashstack upload video1_FR.MP4 video2_FR.MP4 user@host:/path/
+dashstack upload --delete *.MP4 user@host:/path/   # delete local files after upload
+dashstack upload --dry-run *.MP4 user@host:/path/   # preview without transferring
+```
+
+### `download`
+
+Pull files from a remote source via rsync over SSH.
+
+```bash
+dashstack download user@host:/path/*.MP4 ./videos/
+dashstack download --delete user@host:/path/*.MP4   # delete remote files after download
+dashstack download --dry-run user@host:/path/*.MP4   # preview without transferring
+```
+
+## Stacking options
 
 | Flag | Description |
 |------|-------------|
 | `input_dir` | Source directory (default: `.`) |
 | `--output PATH` | Single combined output file (omit for split mode) |
 | `--gap-threshold N` | Seconds of gap to split runs (default: `5.0`) |
-| `--clean` | Delete source `_F`/`_R` files covered by `_FR` output |
+| `--clean` | Delete source files and superseded `_FR` files covered by output |
 | `--dry-run` | Preview the plan without encoding |
 | `--limit N` | Process only the first N pairs |
 | `--pipeline auto\|single-pass\|segment` | Processing strategy (default: `auto`) |

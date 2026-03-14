@@ -39,6 +39,11 @@ Key flow in `src/dashstack/cli.py`:
    - **single-pass**: Feeds two concat-demuxer lists (all fronts, all rears) into one ffmpeg invocation. Used for non-GPU HW encoders or single-pair runs. Only supports `ClipPair`s.
    - **segment** (`run_segment_pipeline`): Handles mixed `Segment` lists (`ClipPair` + `MergedClip`). Encodes each `ClipPair` individually (in parallel via `--workers`), passes `MergedClip` paths through to the concat list without re-encoding, then concatenates with stream copy.
 6. **Encoding**: Builds ffmpeg filter graphs and codec args. When CUDA + NVENC are available, uses `scale_cuda` + `hwdownload` + CPU `vstack` to keep decode/scale on GPU. Otherwise uses CPU filters (`scale` + `pad` + `vstack`). Supports `libx264` (CRF mode) and hardware codecs.
-7. **Cleanup** (`--clean`): Deletes source `_F`/`_R` files whose timestamps are covered by `_FR` output files.
+7. **Filename fixing** (`_fix_fr_names`): On every run, automatically probes existing `_FR` files and renames any whose end timestamp is wrong or missing (computed as start + duration).
+8. **Cleanup** (`--clean`): Deletes source `_F`/`_R` files whose timestamps are covered by `_FR` files, and also deletes older `_FR` files that are fully subsumed by a larger `_FR` file.
 
 Key types: `ClipPair` (F+R source pair), `MergedClip` (existing `_FR` file with start/end timestamps), `Segment = Union[ClipPair, MergedClip]`.
+
+## Guidelines
+
+- **Keep README.md updated** when adding, changing, or removing user-facing features (new flags, subcommands, behavior changes). The README is the primary user documentation.
