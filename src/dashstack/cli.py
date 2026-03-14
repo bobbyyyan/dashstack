@@ -1088,14 +1088,24 @@ def _clean_source_files(input_dir: Path, dry_run: bool) -> int:
     if not to_delete:
         return 0
 
+    print(f"\n{len(to_delete)} source files covered by _FR output:")
+    for p in to_delete:
+        print(f"  {p.name}")
+
     if dry_run:
-        print(f"\nWould delete {len(to_delete)} source files:")
-        for p in to_delete:
-            print(f"  {p.name}")
-    else:
-        for p in to_delete:
-            p.unlink()
-        print(f"Cleaned {len(to_delete)} source files.")
+        return len(to_delete)
+
+    try:
+        choice = input("Delete these files? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if choice != "y":
+        return 0
+
+    for p in to_delete:
+        p.unlink()
+    print(f"Deleted {len(to_delete)} source files.")
     return len(to_delete)
 
 
