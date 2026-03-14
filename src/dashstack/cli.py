@@ -369,8 +369,9 @@ def escape_concat_path(path: Path) -> str:
     return str(path).replace("'", "'\\''")
 
 
-def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str]]:
+def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str], list[str]]:
     grouped: dict[str, dict[str, Path]] = {}
+    overwritten_notes: list[str] = []
     unmatched_notes: list[str] = []
 
     for path in sorted(input_dir.iterdir()):
@@ -382,7 +383,12 @@ def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str]]:
 
         timestamp = match.group("timestamp")
         camera = match.group("camera").upper()
-        grouped.setdefault(timestamp, {})[camera] = path
+        existing = grouped.setdefault(timestamp, {}).get(camera)
+        if existing is not None:
+            overwritten_notes.append(
+                f"{timestamp}_{camera}: {existing.name} replaced by {path.name}"
+            )
+        grouped[timestamp][camera] = path
 
     pairs: list[ClipPair] = []
     for timestamp in sorted(grouped):
@@ -395,7 +401,7 @@ def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str]]:
         missing = "F" if "F" not in bucket else "R"
         unmatched_notes.append(f"{timestamp}: present={present}, missing={missing}")
 
-    return pairs, unmatched_notes
+    return pairs, unmatched_notes, overwritten_notes
 
 
 def _use_cuda_filters(args: argparse.Namespace) -> bool:
@@ -523,7 +529,7 @@ def build_segment_command(
             ]
         )
 
-    cmd.extend(["-movflags", "+faststart", "-shortest", str(segment_path)])
+    cmd.extend(["-movflags", "+faststart", str(segment_path)])
     return cmd
 
 
@@ -612,7 +618,7 @@ def build_single_pass_command(
             ]
         )
 
-    cmd.extend(["-movflags", "+faststart", "-shortest", str(output_path)])
+    cmd.extend(["-movflags", "+faststart", str(output_path)])
     return cmd
 
 
@@ -783,7 +789,9 @@ def _main() -> int:
 
     input_dir = args.input_dir.resolve()
     output_path = args.output.resolve()
-    work_dir = args.work_dir.resolve()
+    # Make work dir unique per invocation to avoid collisions when
+    # multiple dashstack processes run concurrently.
+    work_dir = args.work_dir.resolve() / f"run_{os.getpid()}_{int(time.time())}"
 
     workers = args.workers
     if workers is None:
@@ -843,7 +851,11 @@ def _main() -> int:
         else:
             return 1
 
-    pairs, unmatched = discover_pairs(input_dir)
+    pairs, unmatched, overwritten = discover_pairs(input_dir)
+    if overwritten:
+        print("Warning: duplicate clips for same timestamp+camera (last wins):")
+        for note in overwritten:
+            print(f"  - {note}")
     if unmatched:
         if args.missing == "error":
             eprint("Found timestamps with missing camera pairs:")
@@ -872,10 +884,13 @@ def _main() -> int:
         return probe_cache[path]
 
     # Collect all unique files that need probing and probe them in parallel.
-    files_to_probe: list[Path] = [pairs[0].front, pairs[0].rear]
-    if args.audio_source != "none":
+    # Always probe all front clips so we can show gap analysis.
+    files_to_probe: list[Path] = [pairs[0].rear]
+    for pair in pairs:
+        files_to_probe.append(pair.front)
+    if args.audio_source == "rear":
         for pair in pairs:
-            files_to_probe.append(pair.front if args.audio_source == "front" else pair.rear)
+            files_to_probe.append(pair.rear)
     unique_probe_files = list(dict.fromkeys(files_to_probe))
 
     if len(unique_probe_files) > 2 and workers > 1:
@@ -885,6 +900,34 @@ def _main() -> int:
     else:
         for f in unique_probe_files:
             probe(f)
+
+    # Show chronological clip order with gap analysis.
+    def _ts_seconds(ts: str) -> int:
+        d, t = ts.split("_")
+        return (
+            int(d[:4]) * 31536000 + int(d[4:6]) * 2592000 + int(d[6:8]) * 86400
+            + int(t[:2]) * 3600 + int(t[2:4]) * 60 + int(t[4:6])
+        )
+
+    print(f"\nChronological clip order ({len(pairs)} pairs):")
+    gap_count = 0
+    for i, pair in enumerate(pairs, 1):
+        dur = probe(pair.front).duration
+        if i == 1:
+            gap_label = ""
+        else:
+            prev = pairs[i - 2]
+            prev_end = _ts_seconds(prev.timestamp) + probe(prev.front).duration
+            gap = _ts_seconds(pair.timestamp) - prev_end
+            if gap > 5:
+                gap_label = f"  *** gap {gap:.0f}s ***"
+                gap_count += 1
+            else:
+                gap_label = ""
+        print(f"  {i:3d}. {pair.timestamp} ({dur:.0f}s)  F={pair.front.name}  R={pair.rear.name}{gap_label}")
+    if gap_count:
+        print(f"  ({gap_count} gap{'s' if gap_count != 1 else ''} detected)")
+    print()
 
     first_pair = pairs[0]
     front_probe = probe(first_pair.front)
