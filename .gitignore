@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Raw and rendered media
+*.MP4
+*.mp4
+*.MOV
+*.mov
+
+# DashStack working directory
+.dashstack_work/
