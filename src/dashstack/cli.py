@@ -549,7 +549,7 @@ def _print_split_plan(
     probe: Callable[[Path], ClipProbe],
     input_dir: Path,
 ) -> None:
-    """Print a visual map of clips grouped into _FR output files."""
+    """Print a visual map of source files bracketed into _FR output files."""
     total_pairs = sum(sum(1 for s in r if isinstance(s, ClipPair)) for r in runs)
     total_merged = sum(sum(1 for s in r if isinstance(s, MergedClip)) for r in runs)
 
@@ -563,47 +563,63 @@ def _print_split_plan(
         f" → {len(runs)} output file{'s' if len(runs) != 1 else ''}\n"
     )
 
-    clip_num = 0
-    collapse_threshold = 6
-    show_head = 3
+    collapse_threshold = 4  # segments
+    show_head = 2
     show_tail = 1
+
+    def _seg_lines(seg: Segment) -> list[str]:
+        if isinstance(seg, MergedClip):
+            return [seg.path.name]
+        return [seg.front.name, seg.rear.name]
 
     for ri, run in enumerate(runs):
         fr_path = _fr_output_path(run, input_dir)
-
         run_dur = sum(_seg_duration(s, probe) for s in run)
         n_pairs = sum(1 for s in run if isinstance(s, ClipPair))
         n_merged = sum(1 for s in run if isinstance(s, MergedClip))
 
-        # Header
-        print(f"  ┌ {fr_path.name}")
+        # Single MergedClip — already done.
+        if len(run) == 1 and isinstance(run[0], MergedClip):
+            print(f"  {run[0].path.name}  ── already merged")
+        else:
+            # Build display lines (one per file, with collapse for large runs).
+            lines: list[str] = []
+            collapse = len(run) > collapse_threshold
+            if collapse:
+                hidden = len(run) - show_head - show_tail
+                for seg in run[:show_head]:
+                    lines.extend(_seg_lines(seg))
+                lines.append(f"⋮ ({hidden} more)")
+                for seg in run[-show_tail:]:
+                    lines.extend(_seg_lines(seg))
+            else:
+                for seg in run:
+                    lines.extend(_seg_lines(seg))
 
-        # Clips (collapse large runs)
-        collapse = len(run) > collapse_threshold
-        for si, seg in enumerate(run):
-            clip_num += 1
-            ts = _seg_start_ts(seg)
-            dur = _seg_duration(seg, probe)
+            n_lines = len(lines)
+            arrow_idx = (n_lines - 1) // 2
+            max_w = max(len(l) for l in lines)
 
-            if collapse and show_head <= si < len(run) - show_tail:
-                if si == show_head:
-                    hidden = len(run) - show_head - show_tail
-                    print(f"  │       ⋮ ({hidden} more)")
-                continue
+            parts = []
+            if n_pairs:
+                parts.append(f"{n_pairs} pair{'s' if n_pairs != 1 else ''}")
+            if n_merged:
+                parts.append(f"{n_merged} merged")
+            label = f"→ {fr_path.name} ({' + '.join(parts)} · {_fmt_time(run_dur)})"
 
-            suffix = ""
-            if isinstance(seg, MergedClip):
-                suffix = f"  ← {seg.path.name}"
-
-            print(f"  │  {clip_num:3d}. {ts}  {dur:3.0f}s{suffix}")
-
-        # Footer
-        parts = []
-        if n_pairs:
-            parts.append(f"{n_pairs} pair{'s' if n_pairs != 1 else ''}")
-        if n_merged:
-            parts.append(f"{n_merged} merged")
-        print(f"  └ {' + '.join(parts)} · {_fmt_time(run_dur)}")
+            for i, line in enumerate(lines):
+                padded = line.ljust(max_w)
+                if n_lines == 1:
+                    print(f"  {padded}  ─{label}")
+                elif i == arrow_idx:
+                    bracket = "┐" if i == 0 else "┘" if i == n_lines - 1 else "┤"
+                    print(f"  {padded}  {bracket}{label}")
+                elif i == 0:
+                    print(f"  {padded}  ┐")
+                elif i == n_lines - 1:
+                    print(f"  {padded}  ┘")
+                else:
+                    print(f"  {padded}  │")
 
         # Gap to next run
         if ri < len(runs) - 1:
