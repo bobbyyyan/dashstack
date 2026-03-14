@@ -326,12 +326,11 @@ def build_video_encode_args(args: argparse.Namespace, cuda_filters: bool = False
             "libx264",
             "-preset",
             args.preset,
+            "-crf",
+            str(args.crf),
+            "-pix_fmt",
+            "yuv420p",
         ]
-        if getattr(args, "use_abr", False):
-            result.extend(["-b:v", args.video_bitrate])
-        else:
-            result.extend(["-crf", str(args.crf)])
-        result.extend(["-pix_fmt", "yuv420p"])
         encode_threads = getattr(args, "encode_threads", 0)
         if encode_threads:
             result.extend(["-threads", str(encode_threads)])
@@ -702,9 +701,9 @@ def _main() -> int:
             # outperforms multi-threaded CPU encoding.
             args.video_codec = hw_codec
         elif cores >= 4 and hw_codec != "libx264":
-            # Multi-threaded libx264 ultrafast outperforms single-threaded
-            # hardware encoders at high resolutions via parallel segment
-            # encoding.  ABR mode keeps file size comparable to HW encoders.
+            # Multi-threaded libx264 ultrafast with CRF outperforms
+            # single-threaded HW encoders at high resolutions via parallel
+            # segment encoding.
             args.video_codec = "libx264"
             args.preset = "ultrafast"
             cpu_optimized = True
@@ -806,8 +805,7 @@ def _main() -> int:
     selected_audio_any = any(selected_audio_presence)
     selected_audio_all = all(selected_audio_presence) if selected_audio_presence else False
 
-    # Configure ABR mode and thread allocation for CPU-optimized encoding.
-    args.use_abr = cpu_optimized
+    # Configure thread allocation for CPU-optimized encoding.
     args.encode_threads = 0
     if cpu_optimized:
         effective_workers_est = min(workers, len(pairs))
@@ -822,17 +820,14 @@ def _main() -> int:
     print(f"Output FPS: {fps_expr}")
     print(f"Pipeline mode: {args.pipeline}")
     if cpu_optimized:
-        codec_label = f"{args.video_codec}/{args.preset} ABR (cpu-optimized)"
+        codec_label = f"{args.video_codec}/{args.preset} CRF (cpu-optimized)"
     elif codec_auto:
         codec_label = f"{args.video_codec} (detected)"
     else:
         codec_label = args.video_codec
     print(f"Video codec: {codec_label}")
     if args.video_codec == "libx264":
-        if args.use_abr:
-            print(f"Video bitrate: {args.video_bitrate}")
-        else:
-            print(f"x264 preset/crf: {args.preset}/{args.crf}")
+        print(f"x264 preset/crf: {args.preset}/{args.crf}")
     else:
         print(f"Video bitrate: {args.video_bitrate}")
     print(f"Audio source: {args.audio_source}")
