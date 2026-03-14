@@ -273,7 +273,7 @@ def run_command(cmd: list[str], dry_run: bool) -> None:
         return
     printable = shlex.join(cmd)
     print(f"$ {printable}")
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
 
 
 def _fmt_time(seconds: float) -> str:
@@ -341,7 +341,9 @@ def _run_with_progress(
     except ValueError:
         idx = 1
     cmd[idx:idx] = ["-progress", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+    )
     assert proc.stdout is not None
     for line in proc.stdout:
         if line.startswith("out_time_us="):
@@ -1634,7 +1636,9 @@ def _upload(args: argparse.Namespace) -> int:
     printable = shlex.join(cmd)
     print(f"$ {printable}")
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+    )
     assert proc.stdout is not None
 
     bytes_done = 0
