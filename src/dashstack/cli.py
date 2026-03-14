@@ -314,7 +314,12 @@ def discover_pairs(input_dir: Path) -> tuple[list[ClipPair], list[str]]:
     return pairs, unmatched_notes
 
 
-def build_video_encode_args(args: argparse.Namespace) -> list[str]:
+def _use_cuda_filters(args: argparse.Namespace) -> bool:
+    """Return True if full CUDA-accelerated filter graph should be used."""
+    return args.hwaccel == "cuda" and "nvenc" in args.video_codec
+
+
+def build_video_encode_args(args: argparse.Namespace, cuda_filters: bool = False) -> list[str]:
     if args.video_codec == "libx264":
         result = [
             "-c:v",
@@ -337,9 +342,11 @@ def build_video_encode_args(args: argparse.Namespace) -> list[str]:
         args.video_codec,
         "-b:v",
         args.video_bitrate,
-        "-pix_fmt",
-        "yuv420p",
     ]
+    if not cuda_filters:
+        codec_args.extend(["-pix_fmt", "yuv420p"])
+    if "nvenc" in args.video_codec:
+        codec_args.extend(["-preset", "p1"])
     if args.video_codec.endswith("videotoolbox"):
         codec_args.extend(["-allow_sw", "1"])
     if args.video_codec == "hevc_videotoolbox":
@@ -353,6 +360,8 @@ def _hwaccel_input(args: argparse.Namespace, path: str) -> list[str]:
     flags: list[str] = []
     if args.hwaccel != "none":
         flags.extend(["-hwaccel", args.hwaccel])
+        if _use_cuda_filters(args):
+            flags.extend(["-hwaccel_output_format", "cuda"])
     flags.extend(["-i", path])
     return flags
 
@@ -374,13 +383,25 @@ def build_segment_command(
     fps_expr: str,
     selected_has_audio: bool,
 ) -> list[str]:
-    filter_complex = (
-        f"[0:v]scale={target_width}:{front_panel_h}:force_original_aspect_ratio=decrease,"
-        f"pad={target_width}:{front_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[top];"
-        f"[1:v]scale={target_width}:{rear_panel_h}:force_original_aspect_ratio=decrease,"
-        f"pad={target_width}:{rear_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[bottom];"
-        f"[top][bottom]vstack=inputs=2:shortest=1,fps={fps_expr},format=yuv420p[v]"
-    )
+    cuda_filters = _use_cuda_filters(args)
+    if cuda_filters:
+        total_h = front_panel_h + rear_panel_h
+        filter_complex = (
+            f"color=s={target_width}x{total_h}:c=black:r={fps_expr},"
+            f"format=yuv420p,hwupload_cuda[canvas];"
+            f"[0:v]scale_cuda={target_width}:{front_panel_h}:format=yuv420p[top];"
+            f"[canvas][top]overlay_cuda=0:0[mid];"
+            f"[1:v]scale_cuda={target_width}:{rear_panel_h}:format=yuv420p[bot];"
+            f"[mid][bot]overlay_cuda=0:{front_panel_h}[v]"
+        )
+    else:
+        filter_complex = (
+            f"[0:v]scale={target_width}:{front_panel_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{front_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[top];"
+            f"[1:v]scale={target_width}:{rear_panel_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{rear_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[bottom];"
+            f"[top][bottom]vstack=inputs=2:shortest=1,fps={fps_expr},format=yuv420p[v]"
+        )
 
     cmd = [
         args.ffmpeg_bin,
@@ -397,7 +418,7 @@ def build_segment_command(
         "-map",
         "[v]",
     ])
-    cmd.extend(build_video_encode_args(args))
+    cmd.extend(build_video_encode_args(args, cuda_filters=cuda_filters))
 
     if args.audio_source == "none":
         cmd.extend(["-an"])
@@ -438,13 +459,25 @@ def build_single_pass_command(
     selected_audio_any: bool,
     selected_audio_all: bool,
 ) -> list[str]:
-    filter_complex = (
-        f"[0:v]scale={target_width}:{front_panel_h}:force_original_aspect_ratio=decrease,"
-        f"pad={target_width}:{front_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[top];"
-        f"[1:v]scale={target_width}:{rear_panel_h}:force_original_aspect_ratio=decrease,"
-        f"pad={target_width}:{rear_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[bottom];"
-        f"[top][bottom]vstack=inputs=2:shortest=1,fps={fps_expr},format=yuv420p[v]"
-    )
+    cuda_filters = _use_cuda_filters(args)
+    if cuda_filters:
+        total_h = front_panel_h + rear_panel_h
+        filter_complex = (
+            f"color=s={target_width}x{total_h}:c=black:r={fps_expr},"
+            f"format=yuv420p,hwupload_cuda[canvas];"
+            f"[0:v]scale_cuda={target_width}:{front_panel_h}:format=yuv420p[top];"
+            f"[canvas][top]overlay_cuda=0:0[mid];"
+            f"[1:v]scale_cuda={target_width}:{rear_panel_h}:format=yuv420p[bot];"
+            f"[mid][bot]overlay_cuda=0:{front_panel_h}[v]"
+        )
+    else:
+        filter_complex = (
+            f"[0:v]scale={target_width}:{front_panel_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{front_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[top];"
+            f"[1:v]scale={target_width}:{rear_panel_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{rear_panel_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[bottom];"
+            f"[top][bottom]vstack=inputs=2:shortest=1,fps={fps_expr},format=yuv420p[v]"
+        )
 
     cmd = [
         args.ffmpeg_bin,
@@ -455,11 +488,15 @@ def build_single_pass_command(
     ]
     if args.hwaccel != "none":
         cmd.extend(["-hwaccel", args.hwaccel])
+        if cuda_filters:
+            cmd.extend(["-hwaccel_output_format", "cuda"])
     cmd.extend([
         "-f", "concat", "-safe", "0", "-i", str(front_list_path),
     ])
     if args.hwaccel != "none":
         cmd.extend(["-hwaccel", args.hwaccel])
+        if cuda_filters:
+            cmd.extend(["-hwaccel_output_format", "cuda"])
     cmd.extend([
         "-f", "concat", "-safe", "0", "-i", str(rear_list_path),
         "-filter_complex",
@@ -467,7 +504,7 @@ def build_single_pass_command(
         "-map",
         "[v]",
     ])
-    cmd.extend(build_video_encode_args(args))
+    cmd.extend(build_video_encode_args(args, cuda_filters=cuda_filters))
 
     if args.audio_source == "none":
         cmd.extend(["-an"])
@@ -809,6 +846,8 @@ def _main() -> int:
     if args.hwaccel != "none":
         hwaccel_label = f"{args.hwaccel} (detected)" if hwaccel_auto else args.hwaccel
         print(f"HW decode: {hwaccel_label}")
+    if _use_cuda_filters(args):
+        print("GPU filters: scale_cuda + overlay_cuda (full CUDA pipeline)")
     print(f"Workers: {workers}")
     print(f"Work directory: {work_dir}")
     print(f"Output file: {output_path}")
@@ -862,6 +901,20 @@ def _main() -> int:
                     "Pipeline selected: segment "
                     "(single-pass cannot preserve mixed audio presence)"
                 )
+                run_segment_pipeline(
+                    args=args,
+                    pairs=pairs,
+                    probe=probe,
+                    work_dir=work_dir,
+                    output_path=output_path,
+                    target_width=target_width,
+                    front_panel_h=front_panel_h,
+                    rear_panel_h=rear_panel_h,
+                    fps_expr=fps_expr,
+                    workers=workers,
+                )
+            elif _use_cuda_filters(args) and len(pairs) > 1 and workers > 1:
+                print("Pipeline selected: segment (parallel GPU encoding)")
                 run_segment_pipeline(
                     args=args,
                     pairs=pairs,
