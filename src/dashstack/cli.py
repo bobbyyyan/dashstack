@@ -1920,7 +1920,7 @@ def _find_duplicate_regions(
     # previous frame is significantly higher than the local norm.
     sorted_diffs = sorted(diffs)
     median_diff = sorted_diffs[len(sorted_diffs) // 2]
-    cut_threshold = max(median_diff * 3, 15.0)
+    cut_threshold = max(median_diff * 2.5, 15.0)
 
     cut_points = [t + 1 for t, d in enumerate(diffs) if d > cut_threshold]
 
@@ -1930,38 +1930,60 @@ def _find_duplicate_regions(
     match_threshold = 8.0  # strict — actual dups are near-identical
     min_match = max(2, fps)  # at least ~1 second of sustained match
 
-    regions: list[tuple[float, float]] = []
+    avg_mad_threshold = 6.0  # average MAD across the match must be below this
+
+    # Each region: (start_seconds, duration_seconds, offset_seconds, avg_mad)
+    regions: list[tuple[float, float, float, float]] = []
     skip_until = 0
 
     for cp in cut_points:
         if cp < skip_until:
             continue
 
+        best_d = 0
         best_len = 0
+        best_mad_sum = 0.0
 
         for d in range(fps, min(max_offset + 1, cp + 1)):
-            if _frame_mad(frames[cp], frames[cp - d], match_threshold) > match_threshold:
+            # Skip if the match already existed before the cut — this
+            # means the scene is static (e.g. stopped at a light), not
+            # a genuine duplicate from overlapping clips.
+            if cp >= d + 1 and _frame_mad(
+                frames[cp - 1], frames[cp - 1 - d], match_threshold
+            ) <= match_threshold:
+                continue
+
+            first_mad = _frame_mad(frames[cp], frames[cp - d], match_threshold)
+            if first_mad > match_threshold:
                 continue
 
             # Count how many consecutive frames match at this offset.
             match_len = 1
+            mad_sum = first_mad
             while (
                 cp + match_len < len(frames)
                 and cp - d + match_len < cp
-                and _frame_mad(
+            ):
+                m = _frame_mad(
                     frames[cp + match_len],
                     frames[cp - d + match_len],
                     match_threshold,
                 )
-                <= match_threshold
-            ):
+                if m > match_threshold:
+                    break
+                mad_sum += m
                 match_len += 1
 
             if match_len >= min_match and match_len > best_len:
+                best_d = d
                 best_len = match_len
+                best_mad_sum = mad_sum
 
         if best_len > 0:
-            regions.append((cp / fps, best_len / fps))
+            avg_mad = best_mad_sum / best_len
+            if avg_mad > avg_mad_threshold:
+                continue  # match too loose — similar but not duplicate
+            regions.append((cp / fps, best_len / fps, best_d / fps, avg_mad))
             skip_until = cp + best_len
 
     return regions
@@ -2019,10 +2041,10 @@ def _dedup(args: argparse.Namespace) -> int:
             print("  No duplicate regions found.")
             continue
 
-        total_dup = sum(dur for _, dur in regions)
+        total_dup = sum(dur for _, dur, _, _ in regions)
         print(f"  Found {len(regions)} duplicate region(s) ({total_dup:.1f}s total):")
-        for start, dur in regions:
-            print(f"    {_fmt_time(start)} ({dur:.1f}s)")
+        for start, dur, offset, _ in regions:
+            print(f"    {_fmt_time(start)} ({dur:.1f}s, repeats {_fmt_time(start - offset)})")
 
         if args.dry_run:
             continue
@@ -2030,7 +2052,7 @@ def _dedup(args: argparse.Namespace) -> int:
         # Build good (non-duplicate) sections.
         good_sections: list[tuple[float, float]] = []
         pos = 0.0
-        for start, dur in regions:
+        for start, dur, _, _ in regions:
             if start > pos:
                 good_sections.append((pos, start))
             pos = start + dur
