@@ -50,6 +50,8 @@ The end timestamp in `_FR` filenames reflects the actual end time of the video (
 
 On re-runs, existing `_FR` files are detected and reused — source clips already covered by an `_FR` file are skipped, so only new pairs get encoded. Existing `_FR` filenames are automatically corrected if their end timestamp is wrong or missing.
 
+Event clips (`EVT_*`) typically include a pre-trigger buffer, so their filename timestamp marks the trigger moment, not the start of the file. When an EVT clip is followed by a regular `REC_*` clip, DashStack infers the EVT's real start time from the next clip's start (since the camera records continuously) and trims the prior `REC_*` accordingly — so the EVT plays in full, with no duplicated footage and no time jumps at the seam.
+
 ### Single-file mode
 
 Combine everything into one file:

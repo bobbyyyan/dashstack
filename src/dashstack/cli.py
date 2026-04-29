@@ -610,6 +610,42 @@ def _seg_start_ts(seg: Segment) -> str:
     return seg.start_ts if isinstance(seg, MergedClip) else seg.timestamp
 
 
+def _is_evt_segment(seg: Segment) -> bool:
+    """True if the segment is an event clip (filename starts with EVT_).
+
+    Event clips contain a pre-trigger buffer, so the filename timestamp is the
+    trigger moment, not the file's real start time.
+    """
+    name = (seg.path if isinstance(seg, MergedClip) else seg.front).name
+    return name.upper().startswith("EVT")
+
+
+def _real_start_seconds(
+    segments: list["Segment"],
+    idx: int,
+    probe: Callable[[Path], ClipProbe],
+) -> float:
+    """Real start time (epoch seconds) of segment at *idx*.
+
+    For non-EVT segments, this is the filename timestamp. For EVT segments,
+    the filename marks the trigger moment, not the file start; the real start
+    is inferred from the next non-EVT segment's start (real_start = next_start
+    - duration), since the dashcam records continuously and the EVT file ends
+    exactly where the next REC begins.
+    """
+    seg = segments[idx]
+    filename_start = _ts_seconds(_seg_start_ts(seg))
+    if not _is_evt_segment(seg):
+        return filename_start
+    if idx + 1 < len(segments):
+        next_seg = segments[idx + 1]
+        if not _is_evt_segment(next_seg):
+            inferred = _ts_seconds(_seg_start_ts(next_seg)) - _seg_duration(seg, probe)
+            if inferred < filename_start:
+                return inferred
+    return filename_start
+
+
 def split_into_runs(
     pairs: list[ClipPair],
     merged: list[MergedClip],
@@ -692,14 +728,12 @@ def _compute_overlaps(
     Returns one entry per segment: the truncated duration if the segment
     overlaps with the next one, or None if no truncation is needed.
     """
-    result: list[float | None] = [None] * len(segments)
-    for i in range(len(segments) - 1):
-        curr_start = _ts_seconds(_seg_start_ts(segments[i]))
+    n = len(segments)
+    result: list[float | None] = [None] * n
+    starts = [_real_start_seconds(segments, i, probe) for i in range(n)]
+    for i in range(n - 1):
         curr_dur = _seg_duration(segments[i], probe)
-        curr_end = curr_start + curr_dur
-
-        next_start = _ts_seconds(_seg_start_ts(segments[i + 1]))
-        overlap = curr_end - next_start
+        overlap = (starts[i] + curr_dur) - starts[i + 1]
         if overlap > 0:
             result[i] = max(0.0, curr_dur - overlap)
     return result
