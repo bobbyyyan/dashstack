@@ -16,3 +16,10 @@ dist/
 build/
 *.egg-info/
 src/*.egg-info/
+
+# SwiftPM build artifacts (gui/)
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/
+gui/DashStack.app/
