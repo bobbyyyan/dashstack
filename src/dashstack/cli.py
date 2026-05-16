@@ -1511,19 +1511,30 @@ def _main(args: argparse.Namespace) -> int:
         return 0
 
     probe_cache: dict[Path, ClipProbe] = {}
+    corrupt_files: set[Path] = set()
 
     def probe(path: Path) -> ClipProbe:
         if path not in probe_cache:
-            probe_cache[path] = ffprobe_clip(path, args.ffprobe_bin)
+            try:
+                probe_cache[path] = ffprobe_clip(path, args.ffprobe_bin)
+            except (subprocess.CalledProcessError, RuntimeError):
+                corrupt_files.add(path)
+                raise
         return probe_cache[path]
 
-    # Collect all unique files that need probing and probe them in parallel.
-    files_to_probe: list[Path] = [pairs[0].rear]
+    def _probe_silent(path: Path) -> None:
+        try:
+            probe(path)
+        except (subprocess.CalledProcessError, RuntimeError):
+            pass
+
+    # Probe every file we might touch so corruption (e.g. a truncated mp4
+    # with no moov atom from a card pulled mid-write) is caught before
+    # encoding rather than crashing the run.
+    files_to_probe: list[Path] = []
     for pair in pairs:
         files_to_probe.append(pair.front)
-    if args.audio_source == "rear":
-        for pair in pairs:
-            files_to_probe.append(pair.rear)
+        files_to_probe.append(pair.rear)
     for mc in merged_clips:
         files_to_probe.append(mc.path)
     unique_probe_files = list(dict.fromkeys(files_to_probe))
@@ -1531,10 +1542,37 @@ def _main(args: argparse.Namespace) -> int:
     if len(unique_probe_files) > 2 and workers > 1:
         print(f"Probing {len(unique_probe_files)} clips ({workers} parallel)...")
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            list(executor.map(probe, unique_probe_files))
+            list(executor.map(_probe_silent, unique_probe_files))
     else:
         for f in unique_probe_files:
-            probe(f)
+            _probe_silent(f)
+
+    if corrupt_files:
+        print(f"\nSkipping {len(corrupt_files)} corrupt or unreadable file(s):")
+        for p in sorted(corrupt_files, key=lambda x: x.name):
+            print(f"  - {p.name}")
+        dropped_pairs = [
+            p for p in pairs
+            if p.front in corrupt_files or p.rear in corrupt_files
+        ]
+        if dropped_pairs:
+            print(f"Dropping {len(dropped_pairs)} pair(s) with corrupt clips:")
+            for p in dropped_pairs:
+                print(f"  - {p.timestamp}")
+        dropped_set = set(dropped_pairs)
+        pairs = [p for p in pairs if p not in dropped_set]
+        merged_clips = [m for m in merged_clips if m.path not in corrupt_files]
+
+        if not pairs and not merged_clips:
+            eprint("No usable clips remain after dropping corrupt files.")
+            return 1
+        if not pairs:
+            if args.clean:
+                print("All remaining clips already merged into _FR files.")
+                _clean_source_files(input_dir, args.dry_run)
+                return 0
+            print("All remaining clips already merged into _FR files. Nothing to do.")
+            return 0
 
     # Compute runs early so we can use them in the visualization.
     if split_mode:
