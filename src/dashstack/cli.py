@@ -723,17 +723,29 @@ def _compute_overlaps(
     segments: list[Segment],
     probe: Callable[[Path], ClipProbe],
 ) -> list[float | None]:
-    """Compute truncated durations for segments that overlap with the next.
+    """Compute truncated durations for segments that overlap with later ones.
 
     Returns one entry per segment: the truncated duration if the segment
-    overlaps with the next one, or None if no truncation is needed.
+    overlaps with any subsequent segment, or None if no truncation is needed.
+
+    Compares against the earliest real-start of any later segment, not just
+    the immediate next one. Filename ordering can place a segment with an
+    earlier real-start later in the list (e.g. an EVT clip whose pre-trigger
+    buffer makes its real start precede the filename-adjacent REC that comes
+    after it). Looking only at i+1 misses overlaps with such segments.
     """
     n = len(segments)
     result: list[float | None] = [None] * n
     starts = [_real_start_seconds(segments, i, probe) for i in range(n)]
+    # Earliest real-start of any segment at or after index j (suffix-min over starts).
+    earliest_after: list[float] = [0.0] * n
+    if n:
+        earliest_after[n - 1] = starts[n - 1]
+        for j in range(n - 2, -1, -1):
+            earliest_after[j] = min(starts[j], earliest_after[j + 1])
     for i in range(n - 1):
         curr_dur = _seg_duration(segments[i], probe)
-        overlap = (starts[i] + curr_dur) - starts[i + 1]
+        overlap = (starts[i] + curr_dur) - earliest_after[i + 1]
         if overlap > 0:
             result[i] = max(0.0, curr_dur - overlap)
     return result
